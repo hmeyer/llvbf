@@ -2,9 +2,10 @@
 //! segments at calls and memory accesses, assigns frame slots to SSA values and
 //! lays out global variables in memory.
 
+use crate::arith::limbs;
 use crate::ir::*;
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What a memory access is for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +47,34 @@ pub enum Step {
     VaSetup(usize),
 }
 
+/// The shared arithmetic routines: multiplication, unsigned and signed division
+/// (each division routine yields both quotient and remainder).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArithKind {
+    Mul,
+    UDiv,
+    SDiv,
+}
+
+impl ArithKind {
+    pub fn of(op: BinOp) -> Option<ArithKind> {
+        match op {
+            BinOp::Mul => Some(ArithKind::Mul),
+            BinOp::UDiv | BinOp::URem => Some(ArithKind::UDiv),
+            BinOp::SDiv | BinOp::SRem => Some(ArithKind::SDiv),
+            _ => None,
+        }
+    }
+}
+
+/// A multiplication or division of `n`-limb operands serviced by a shared routine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArithOp {
+    pub instr: usize,
+    pub op: BinOp,
+    pub n: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SegEnd {
     /// The segment ends with the block terminator.
@@ -54,6 +83,8 @@ pub enum SegEnd {
     Call(usize),
     /// The segment ends with a memory access request.
     Access(Access),
+    /// The segment ends with a request to a shared arithmetic routine.
+    Arith(ArithOp),
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +162,10 @@ pub struct Plan {
     pub exit_id: u16,
     /// Distinct (is_store, width) access kinds used by the program.
     pub access_kinds: Vec<(bool, usize)>,
+    /// Distinct (kind, limbs) arithmetic routines used by the program.
+    pub arith_kinds: Vec<(ArithKind, usize)>,
+    /// Size of the operand/result area of arithmetic requests (two operands).
+    pub arg_size: usize,
     pub mem_size: usize,
     /// Functions (by `FuncId`) that use the memory stack pointer themselves or
     /// through a callee: allocas, variadic calls, `va_arg`, indirect calls.
@@ -282,6 +317,7 @@ fn plan_function(
     fid: FuncId,
     next_id: &mut u16,
     access_kinds: &mut Vec<(bool, usize)>,
+    arith_kinds: &mut Vec<(ArithKind, usize)>,
 ) -> Result<FuncPlan> {
     let types = &m.types;
     let mut slots: HashMap<Value, Slot> = HashMap::new();
@@ -355,32 +391,19 @@ fn plan_function(
             _ => false,
         }
     };
-    // Dedicated slots for phis and cross-block values; interval allocation within a
-    // per-function pool for the others.
-    let mut loff = 0usize;
+    // Slots. Block-local values are interval-allocated within a per-function pool
+    // (close to scratch). Phis and cross-block values are interval-allocated in the
+    // dedicated area using a liveness analysis over the CFG, so values that are never
+    // live at the same time share a slot.
     let mut pool_size = 0usize;
     let mut extra_slots = HashMap::new();
-    let mut alloc_local = |size: usize| -> Slot {
-        let s = Slot {
-            kind: SlotKind::Local,
-            off: loff,
-            size,
-        };
-        loff += size;
-        s
-    };
-    for bb in &f.blocks {
-        for phi in &bb.phis {
-            slots.insert(phi.dest, alloc_local(types.size(phi.ty)));
-        }
-    }
     for (bi, bb) in f.blocks.iter().enumerate() {
-        let mut pool = PoolAllocator::default();
+        let mut pool = IntervalAllocator::default();
         for (ii, inst) in bb.instrs.iter().enumerate() {
             pool.release_dead(ii);
             if let Some(dest) = inst.dest {
-                let size = types.size(inst.ty);
                 if is_local(dest) {
+                    let size = types.size(inst.ty);
                     let end = uses
                         .get(&dest)
                         .and_then(|u| u.iter().map(|(_, p)| *p).max())
@@ -394,8 +417,6 @@ fn plan_function(
                             size,
                         },
                     );
-                } else {
-                    slots.insert(dest, alloc_local(size));
                 }
             }
             let needs_extra = match &inst.op {
@@ -419,6 +440,7 @@ fn plan_function(
         }
         pool_size = pool_size.max(pool.top);
     }
+    let loff = allocate_cross_block(f, types, &uses, &is_local, &mut slots);
     let instr_uses: HashMap<Value, usize> = instr_uses
         .into_iter()
         .filter(|(v, _)| is_local(*v))
@@ -439,6 +461,7 @@ fn plan_function(
             prev_end: None,
             next_id,
             access_kinds,
+            arith_kinds,
         };
         for (i, inst) in bb.instrs.iter().enumerate() {
             match &inst.op {
@@ -449,6 +472,9 @@ fn plan_function(
                 Op::Store { value, align, .. } => {
                     let a = access_align(types, value.ty, *align);
                     sb.access(i, true, types.size(value.ty), a, 0, AccessRole::Plain);
+                }
+                Op::Binary { kind, a, b } if routed_arith(types, *kind, a, b) => {
+                    sb.arith(i, *kind, limbs(types.bits(a.ty)?));
                 }
                 Op::VaArg { .. } => {
                     sb.access(i, false, types.ptr_bytes, 2, 0, AccessRole::VaPtrLoad);
@@ -508,9 +534,9 @@ fn plan_function(
     })
 }
 
-/// First-fit interval allocator for the pool of block-local slots.
+/// First-fit allocator of slots for values with known live intervals.
 #[derive(Default)]
-struct PoolAllocator {
+struct IntervalAllocator {
     /// (end position, offset, size) of live intervals.
     live: Vec<(usize, usize, usize)>,
     /// (offset, size) of free ranges.
@@ -518,7 +544,7 @@ struct PoolAllocator {
     top: usize,
 }
 
-impl PoolAllocator {
+impl IntervalAllocator {
     /// Free the slots of values whose last use is before instruction `pos`.
     fn release_dead(&mut self, pos: usize) {
         let (dead, live): (Vec<_>, Vec<_>) =
@@ -543,6 +569,162 @@ impl PoolAllocator {
         self.live.push((end, off, size));
         off
     }
+}
+
+/// Allocate dedicated slots for phis and cross-block values; returns the area size.
+///
+/// Blocks are laid out in order to give every instruction a position (a block of
+/// `k` instructions occupies `k + 1` positions, the last one for its terminator).
+/// A liveness analysis over the CFG yields the values live on entry to and exit from
+/// each block. A value's interval spans from its definition to its last use, widened
+/// to cover every block it is live in and, for phis, the terminators of all
+/// predecessors (where phis are written). Two values live at the same program point
+/// then have overlapping intervals, so the first-fit allocator keeps them apart;
+/// everything else may share a slot.
+fn allocate_cross_block(
+    f: &Function,
+    types: &TypeTable,
+    uses: &HashMap<Value, Vec<(BlockId, usize)>>,
+    is_local: &dyn Fn(Value) -> bool,
+    slots: &mut HashMap<Value, Slot>,
+) -> usize {
+    let nb = f.blocks.len();
+    let mut base = vec![0usize; nb];
+    let mut pos = 0;
+    for (b, bb) in f.blocks.iter().enumerate() {
+        base[b] = pos;
+        pos += bb.instrs.len() + 1;
+    }
+    let term_pos = |b: BlockId| base[b] + f.blocks[b].instrs.len();
+    let successors = |b: BlockId| -> Vec<BlockId> {
+        match &f.blocks[b].term {
+            Terminator::Br(d) => vec![*d],
+            Terminator::CondBr {
+                if_true, if_false, ..
+            } => vec![*if_true, *if_false],
+            Terminator::Switch { cases, default, .. } => {
+                let mut v: Vec<BlockId> = cases.iter().map(|(_, d)| *d).collect();
+                v.push(*default);
+                v
+            }
+            Terminator::Ret(_) | Terminator::Unreachable => vec![],
+        }
+    };
+    // Candidates (phis and non-local instruction results) and where they are defined.
+    let mut def_pos: HashMap<Value, usize> = HashMap::new();
+    for (b, bb) in f.blocks.iter().enumerate() {
+        for phi in &bb.phis {
+            def_pos.insert(phi.dest, base[b]);
+        }
+        for (i, inst) in bb.instrs.iter().enumerate() {
+            if let Some(d) = inst.dest {
+                if !is_local(d) {
+                    def_pos.insert(d, base[b] + i);
+                }
+            }
+        }
+    }
+    // Per block: candidates read before being defined (`upward`), candidates defined,
+    // and candidates read by the phis of successors (live at the end of this block).
+    let mut upward: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    let mut defined: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    let mut phi_out: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    for (b, bb) in f.blocks.iter().enumerate() {
+        for phi in &bb.phis {
+            defined[b].insert(phi.dest);
+            for (val, pred) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    if def_pos.contains_key(&v) {
+                        phi_out[*pred].insert(v);
+                    }
+                }
+            }
+        }
+        let reads = bb
+            .instrs
+            .iter()
+            .flat_map(|inst| op_values(&inst.op).into_iter().chain(inst.dest))
+            .chain(term_values(&bb.term));
+        // `dest` is chained after the operands so a value read by its own definition's
+        // operands is still seen as upward-exposed; SSA forbids that anyway.
+        for v in reads {
+            if def_pos.contains_key(&v) && !defined[b].contains(&v) {
+                upward[b].insert(v);
+            }
+        }
+        for inst in &bb.instrs {
+            if let Some(d) = inst.dest {
+                defined[b].insert(d);
+            }
+        }
+    }
+    let mut live_in: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    let mut live_out: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    loop {
+        let mut changed = false;
+        for b in (0..nb).rev() {
+            let mut out = phi_out[b].clone();
+            for s in successors(b) {
+                out.extend(live_in[s].iter().copied());
+            }
+            let mut inn = upward[b].clone();
+            inn.extend(out.iter().filter(|v| !defined[b].contains(v)));
+            if out != live_out[b] || inn != live_in[b] {
+                live_out[b] = out;
+                live_in[b] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut intervals: Vec<(usize, usize, Value)> = Vec::new();
+    for (&v, &def) in &def_pos {
+        let mut start = def;
+        let mut end = def;
+        for (b, p) in uses.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
+            end = end.max(base[*b] + p);
+        }
+        for b in 0..nb {
+            if live_in[b].contains(&v) {
+                start = start.min(base[b]);
+                end = end.max(base[b]);
+            }
+            if live_out[b].contains(&v) {
+                end = end.max(term_pos(b));
+            }
+        }
+        intervals.push((start, end, v));
+    }
+    for bb in &f.blocks {
+        for phi in &bb.phis {
+            let e = intervals
+                .iter_mut()
+                .find(|(_, _, v)| *v == phi.dest)
+                .unwrap();
+            for (_, pred) in &phi.incoming {
+                e.0 = e.0.min(term_pos(*pred));
+                e.1 = e.1.max(term_pos(*pred));
+            }
+        }
+    }
+    intervals.sort_unstable();
+    let mut alloc = IntervalAllocator::default();
+    for (start, end, v) in intervals {
+        alloc.release_dead(start);
+        let size = types.size(f.value_ty(v));
+        let off = alloc.alloc(size, end);
+        slots.insert(
+            v,
+            Slot {
+                kind: SlotKind::Local,
+                off,
+                size,
+            },
+        );
+    }
+    alloc.top
 }
 
 /// The SSA values an instruction reads.
@@ -604,6 +786,19 @@ pub fn term_values(t: &Terminator) -> Vec<Value> {
     }
 }
 
+/// Multiplications by a variable and all divisions go through the shared routines;
+/// they are far too big to inline. Odd bit widths are kept inline (the routines
+/// work on whole limbs).
+fn routed_arith(types: &TypeTable, op: BinOp, a: &Operand, b: &Operand) -> bool {
+    let Some(kind) = ArithKind::of(op) else {
+        return false;
+    };
+    let Ok(bits) = types.bits(a.ty) else {
+        return false;
+    };
+    bits % 8 == 0 && bits <= 64 && (kind != ArithKind::Mul || b.as_const().is_none())
+}
+
 /// Accumulates the segments of one basic block.
 struct SegBuilder<'a> {
     segments: Vec<Segment>,
@@ -611,6 +806,7 @@ struct SegBuilder<'a> {
     prev_end: Option<SegEnd>,
     next_id: &'a mut u16,
     access_kinds: &'a mut Vec<(bool, usize)>,
+    arith_kinds: &'a mut Vec<(ArithKind, usize)>,
 }
 
 impl<'a> SegBuilder<'a> {
@@ -624,6 +820,15 @@ impl<'a> SegBuilder<'a> {
         });
         *self.next_id = self.next_id.checked_add(1).expect("too many blocks");
         self.prev_end = Some(end);
+    }
+
+    /// Close the segment with an arithmetic routine request.
+    fn arith(&mut self, instr: usize, op: BinOp, n: usize) {
+        let kind = ArithKind::of(op).expect("arithmetic routine kind");
+        if !self.arith_kinds.contains(&(kind, n)) {
+            self.arith_kinds.push((kind, n));
+        }
+        self.finish(SegEnd::Arith(ArithOp { instr, op, n }));
     }
 
     /// Close one segment per aligned chunk of a memory access.
@@ -729,11 +934,12 @@ pub fn plan_module(m: &Module, mem_size: usize, entry: &str) -> Result<Plan> {
     let mut funcs = Vec::new();
     let mut func_plan = HashMap::new();
     let mut access_kinds = Vec::new();
+    let mut arith_kinds = Vec::new();
     for (fid, f) in m.functions.iter().enumerate() {
         if f.is_declaration() {
             continue;
         }
-        let fp = plan_function(m, f, fid, &mut next_id, &mut access_kinds)
+        let fp = plan_function(m, f, fid, &mut next_id, &mut access_kinds, &mut arith_kinds)
             .with_context(|| format!("in function {}", f.name))?;
         func_plan.insert(fid, funcs.len());
         funcs.push(fp);
@@ -811,6 +1017,8 @@ pub fn plan_module(m: &Module, mem_size: usize, entry: &str) -> Result<Plan> {
         start_id,
         exit_id,
         access_kinds,
+        arg_size: 2 * arith_kinds.iter().map(|k| k.1).max().unwrap_or(0),
+        arith_kinds,
         mem_size,
         needs_msp,
     })

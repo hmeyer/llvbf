@@ -7,6 +7,7 @@
 //!
 //! * `calls`      - calls, returns and the frame shift,
 //! * `memory`     - load/store requests and the shared memory routines,
+//! * `muldiv`     - multiplication/division requests and the shared routines,
 //! * `control`    - terminators and phi copies,
 //! * `instr`      - arithmetic, comparisons, casts, GEP, select, ...
 //! * `intrinsics` - builtins and LLVM intrinsics lowered inline.
@@ -16,6 +17,7 @@ mod control;
 mod instr;
 mod intrinsics;
 mod memory;
+mod muldiv;
 
 use crate::arith::*;
 use crate::emit::{Cell, Emitter};
@@ -70,6 +72,8 @@ pub struct Layout {
     /// Pool of block-local slots, placed next to scratch so that most operand
     /// copies travel a short distance.
     pub pool: Cell,
+    /// Operands and results of requests to the shared arithmetic routines.
+    pub arg: Cell,
     /// A spare zero cell next to the slots, used as the temporary of slot-to-slot copies.
     pub copy_tmp: Cell,
     pub scratch: Cell,
@@ -99,7 +103,8 @@ impl Layout {
         let ch_hi = 10; // pads 11, 12
         let tmp = 13;
         let req = 14;
-        let addr_hi = req + plan.access_kinds.len().max(1) as Cell;
+        let num_req = plan.access_kinds.len() + plan.arith_kinds.len();
+        let addr_hi = req + num_req.max(1) as Cell;
         let hops = addr_hi + 1;
         let addr_lo = hops + 1;
         let cnt = addr_lo + 1;
@@ -112,7 +117,8 @@ impl Layout {
         let ret = msp + ptr_bytes as Cell;
         let params = ret + plan.ret_max as Cell;
         let pool = params + plan.params_max as Cell;
-        let copy_tmp = pool + plan.pool_max as Cell;
+        let arg = pool + plan.pool_max as Cell;
+        let copy_tmp = arg + plan.arg_size as Cell;
         let scratch = copy_tmp + 1;
         let locals = scratch + scratch_size as Cell;
         let frame = locals + plan.locals_max as Cell;
@@ -136,6 +142,7 @@ impl Layout {
             ret,
             params,
             pool,
+            arg,
             copy_tmp,
             scratch,
             scratch_size,
@@ -187,6 +194,10 @@ struct Gen<'a> {
     uses_left: HashMap<Value, usize>,
     /// True while emitting a terminator (phi copies, conditions, return values).
     in_terminator: bool,
+    /// Cells beyond the frame the shared arithmetic routines clear before use
+    /// (measured in the first pass), and the most they used in this pass.
+    arith_ws: usize,
+    arith_hw: usize,
 }
 
 /// Compile a module to Brainfuck.
@@ -195,9 +206,9 @@ pub fn compile(m: &Module, opts: &Options) -> Result<Vec<u8>> {
         bail!("memory size must be a positive multiple of 256 and at most 65536");
     }
     let plan = plan_module(m, opts.mem_size, &opts.entry)?;
-    // Pass 1 measures the scratch requirement, pass 2 emits the final code.
-    let (hw, _) = run_gen(m, &plan, opts, 4096)?;
-    let (_, code) = run_gen(m, &plan, opts, hw + 4)?;
+    // Pass 1 measures the scratch requirements, pass 2 emits the final code.
+    let (hw, ws, _) = run_gen(m, &plan, opts, 4096, 0)?;
+    let (_, _, code) = run_gen(m, &plan, opts, hw + 4, ws)?;
     Ok(code)
 }
 
@@ -206,7 +217,8 @@ fn run_gen(
     plan: &Plan,
     opts: &Options,
     scratch_size: usize,
-) -> Result<(usize, Vec<u8>)> {
+    arith_ws: usize,
+) -> Result<(usize, usize, Vec<u8>)> {
     let lay = Layout::new(plan, m.types.ptr_bytes, scratch_size);
     let mut e = Emitter::new();
     e.comments = opts.comments;
@@ -225,13 +237,15 @@ fn run_gen(
         cur: 0,
         uses_left: HashMap::new(),
         in_terminator: false,
+        arith_ws,
+        arith_hw: 0,
     };
     g.emit_program()?;
     let used = g.sc.used();
     if used > scratch_size {
         bail!("internal error: scratch overflow");
     }
-    Ok((used, g.e.into_code()))
+    Ok((used, g.arith_hw, g.e.into_code()))
 }
 
 impl<'a> Gen<'a> {
@@ -484,6 +498,7 @@ impl<'a> Gen<'a> {
         self.e.begin_while(lay.active);
         self.emit_dispatch()?;
         self.emit_memory_routines();
+        self.emit_arith_routines();
         self.e.end_while(lay.active);
         self.comment("end of program");
         Ok(())
@@ -593,6 +608,7 @@ impl<'a> Gen<'a> {
         match &s.prev_end {
             Some(SegEnd::Access(a)) if !a.is_store => self.finish_load(block, bb, *a)?,
             Some(SegEnd::Call(i)) => self.finish_call(bb, *i)?,
+            Some(SegEnd::Arith(op)) => self.finish_arith(bb, *op)?,
             _ => {}
         }
         for step in &s.steps {
@@ -631,6 +647,9 @@ impl<'a> Gen<'a> {
             SegEnd::Access(a) => self
                 .emit_access(block, bb, *a, s)
                 .with_context(|| format!("in {}: {}", fp.name, bb.instrs[a.instr].text))?,
+            SegEnd::Arith(op) => self
+                .emit_arith_request(bb, *op, s)
+                .with_context(|| format!("in {}: {}", fp.name, bb.instrs[op.instr].text))?,
         }
         self.sc.release(m);
         Ok(())
