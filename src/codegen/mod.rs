@@ -74,8 +74,6 @@ pub struct Layout {
     pub pool: Cell,
     /// Operands and results of requests to the shared arithmetic routines.
     pub arg: Cell,
-    /// A spare zero cell next to the slots, used as the temporary of slot-to-slot copies.
-    pub copy_tmp: Cell,
     pub scratch: Cell,
     pub scratch_size: usize,
     /// Dedicated slots of cross-block values and phis.
@@ -118,8 +116,7 @@ impl Layout {
         let params = ret + plan.ret_max as Cell;
         let pool = params + plan.params_max as Cell;
         let arg = pool + plan.pool_max as Cell;
-        let copy_tmp = arg + plan.arg_size as Cell;
-        let scratch = copy_tmp + 1;
+        let scratch = arg + plan.arg_size as Cell;
         let locals = scratch + scratch_size as Cell;
         let frame = locals + plan.locals_max as Cell;
         Layout {
@@ -143,7 +140,6 @@ impl Layout {
             params,
             pool,
             arg,
-            copy_tmp,
             scratch,
             scratch_size,
             locals,
@@ -194,6 +190,8 @@ struct Gen<'a> {
     uses_left: HashMap<Value, usize>,
     /// True while emitting a terminator (phi copies, conditions, return values).
     in_terminator: bool,
+    /// Cross-block values that die on the edge whose phi copies are being emitted.
+    edge_moves: Vec<Value>,
     /// Cells beyond the frame the shared arithmetic routines clear before use
     /// (measured in the first pass), and the most they used in this pass.
     arith_ws: usize,
@@ -237,6 +235,7 @@ fn run_gen(
         cur: 0,
         uses_left: HashMap::new(),
         in_terminator: false,
+        edge_moves: Vec::new(),
         arith_ws,
         arith_hw: 0,
     };
@@ -273,7 +272,8 @@ impl<'a> Gen<'a> {
         self.e.comment(s);
     }
 
-    /// Cell and size of the slot of an SSA value in the current frame.
+    /// Cell and size of the slot of an SSA value in the current frame. The cell
+    /// after the slot (`cell + size`) is its zero pad.
     fn slot(&self, v: Value) -> Result<(Cell, usize)> {
         let s = self
             .fp()
@@ -292,11 +292,15 @@ impl<'a> Gen<'a> {
     }
 
     /// Record a use of `v` and decide whether this use may consume (move) the value
-    /// instead of copying it. Only pooled values qualify: all their uses are in one
+    /// instead of copying it. Pooled values qualify: all their uses are in one
     /// block, so the textual order of uses is the execution order. Inside a
     /// terminator a value may be moved if no instruction uses remain and the
     /// terminator (including phi copies on every edge) mentions it exactly once.
+    /// Cross-block values qualify only as phi inputs that die on the current edge.
     fn consume_use(&mut self, v: Value) -> bool {
+        if self.edge_moves.contains(&v) {
+            return true;
+        }
         let fp = self.fp();
         let Some(&term_uses) = fp.term_uses.get(&v) else {
             return false;
@@ -320,7 +324,7 @@ impl<'a> Gen<'a> {
                 self.e.move_cell(cell + (off + i) as Cell, w.limb(i));
             }
         } else {
-            load_packed(&mut self.e, &mut self.sc, cell + off as Cell, w);
+            copy_packed(&mut self.e, cell + off as Cell, w, cell + size as Cell);
         }
         Ok(())
     }
@@ -378,17 +382,28 @@ impl<'a> Gen<'a> {
     /// Copy (or, on its last use, move) bytes `off..off+n` of an operand straight into
     /// `n` consecutive cells at `dst`, which are cleared first. Used where a value only
     /// needs to change place (arguments, memory requests), to avoid the detour through
-    /// scratch. Constants are set in place.
-    fn transfer_operand(&mut self, op: &Operand, off: usize, dst: Cell, n: usize) -> Result<()> {
+    /// scratch. Constants are set in place with the cell `tmp` near `dst` as the
+    /// temporary; `tmp` is cleared first (the pad of a slot being defined, or a cell of
+    /// a callee frame, may hold garbage) and left zero.
+    fn transfer_operand(
+        &mut self,
+        op: &Operand,
+        off: usize,
+        dst: Cell,
+        n: usize,
+        tmp: Cell,
+    ) -> Result<()> {
         for i in 0..n {
             self.e.clear(dst + i as Cell);
         }
+        // `tmp` is the pad of a slot being defined or lies in a callee frame: clear it.
+        self.e.clear(tmp);
         match &op.kind {
             OperandKind::Value(v) => {
                 let (cell, size) = self.slot(*v)?;
                 let avail = size.saturating_sub(off).min(n);
                 let movable = self.consume_use(*v);
-                let tmp = self.lay.copy_tmp;
+                let tmp = cell + size as Cell;
                 for i in 0..avail {
                     if movable {
                         self.e.move_cell(cell + (off + i) as Cell, dst + i as Cell);
@@ -407,7 +422,6 @@ impl<'a> Gen<'a> {
                 } else {
                     self.ce().bytes(c, op.ty)?
                 };
-                let tmp = self.lay.copy_tmp;
                 for i in 0..n {
                     let b = bytes.get(off + i).copied().unwrap_or(0);
                     self.e.set_using(dst + i as Cell, b, tmp);
@@ -417,10 +431,30 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// Clear a slot about to be (re)defined, including its pad: the cells may hold
+    /// what a value that shared them left behind.
+    fn clear_slot(&mut self, cell: Cell, size: usize) {
+        for i in 0..=size {
+            self.e.clear(cell + i as Cell);
+        }
+    }
+
+    /// The slot of `v`, cleared for its definition (see [`clear_slot`]).
+    fn define_slot(&mut self, v: Value) -> Result<(Cell, usize)> {
+        let (cell, size) = self.slot(v)?;
+        self.clear_slot(cell, size);
+        Ok((cell, size))
+    }
+
     /// Store a work area into the slot of `v`, clearing the whole slot first.
     fn store_result(&mut self, v: Value, w: Work) -> Result<()> {
-        let (cell, size) = self.slot(v)?;
-        self.store_to_cells(cell, size, w);
+        let (cell, size) = self.define_slot(v)?;
+        for i in 0..w.n.min(size) {
+            self.e.move_cell(w.limb(i), cell + i as Cell);
+        }
+        for i in size..w.n {
+            self.e.clear(w.limb(i));
+        }
         Ok(())
     }
 
@@ -437,8 +471,11 @@ impl<'a> Gen<'a> {
     }
 
     fn set_pc(&mut self, base: Cell, id: u16) {
-        self.e.set(base + self.lay.pc_lo, (id & 0xff) as u8);
-        self.e.set(base + self.lay.pc_hi, (id >> 8) as u8);
+        let tmp = base + self.lay.tmp;
+        self.e
+            .set_using(base + self.lay.pc_lo, (id & 0xff) as u8, tmp);
+        self.e
+            .set_using(base + self.lay.pc_hi, (id >> 8) as u8, tmp);
     }
 
     /// Prepare the dispatch-chain idiom cells of the frame at `base` so that the

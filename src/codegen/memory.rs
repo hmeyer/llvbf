@@ -25,10 +25,13 @@ impl<'a> Gen<'a> {
         if a.off + a.width > size {
             bail!("load chunk out of bounds");
         }
+        if a.off == 0 {
+            // First chunk: the slot is being defined.
+            self.clear_slot(cell, size);
+        }
         for k in 0..a.width {
-            let dst = cell + (a.off + k) as Cell;
-            self.e.clear(dst);
-            self.e.move_cell(self.lay.data + k as Cell, dst);
+            self.e
+                .move_cell(self.lay.data + k as Cell, cell + (a.off + k) as Cell);
         }
         Ok(())
     }
@@ -69,9 +72,9 @@ impl<'a> Gen<'a> {
             (Some(op), 0) => {
                 // Straight from the slot into the request cells (the high limbs of a
                 // 32-bit pointer are not addressable and are dropped).
-                self.transfer_operand(op, 0, lay.addr_lo, 1)?;
+                self.transfer_operand(op, 0, lay.addr_lo, 1, lay.tmp)?;
                 if n > 1 {
-                    self.transfer_operand(op, 1, lay.addr_hi, 1)?;
+                    self.transfer_operand(op, 1, lay.addr_hi, 1, lay.tmp)?;
                 }
             }
             _ => {
@@ -100,14 +103,14 @@ impl<'a> Gen<'a> {
         if a.is_store {
             match (a.role, &inst.op) {
                 (AccessRole::Plain, Op::Store { value, .. }) => {
-                    self.transfer_operand(value, a.off, lay.data, a.width)?;
+                    self.transfer_operand(value, a.off, lay.data, a.width, lay.tmp)?;
                 }
                 (AccessRole::VaSpill(k), Op::Call { fn_ty, args, .. }) => {
                     let (layout, _) = va_spill_layout(self.types(), *fn_ty, args)?;
                     let fixed = args.len() - layout.len();
                     let (aoff, _) = layout[k];
                     let arg = &args[fixed + k];
-                    self.transfer_operand(arg, a.off - aoff, lay.data, a.width)?;
+                    self.transfer_operand(arg, a.off - aoff, lay.data, a.width, lay.tmp)?;
                 }
                 (AccessRole::VaStart, _) => {
                     let s = self
@@ -115,11 +118,16 @@ impl<'a> Gen<'a> {
                         .va_slot
                         .ok_or_else(|| anyhow!("va_start in non-variadic function"))?;
                     let cell = self.slot_cell(&s);
-                    self.copy_cells(cell + a.off as Cell, lay.data, a.width);
+                    self.copy_cells(
+                        cell + a.off as Cell,
+                        lay.data,
+                        a.width,
+                        cell + s.size as Cell,
+                    );
                 }
                 (AccessRole::VaCopyStore, _) => {
-                    let (cell, _) = self.extra_slot(block, a.instr)?;
-                    self.copy_cells(cell + a.off as Cell, lay.data, a.width);
+                    let (cell, size) = self.extra_slot(block, a.instr)?;
+                    self.copy_cells(cell + a.off as Cell, lay.data, a.width, cell + size as Cell);
                 }
                 (AccessRole::VaPtrStore, _) => {
                     // The advanced argument pointer: saved pointer + size of the argument slot.
@@ -148,9 +156,8 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Copy `n` cells from `src` to `dst` (cleared first) through the copy temporary.
-    fn copy_cells(&mut self, src: Cell, dst: Cell, n: usize) {
-        let tmp = self.lay.copy_tmp;
+    /// Copy `n` cells from `src` to `dst` (cleared first) through the zero cell `tmp`.
+    fn copy_cells(&mut self, src: Cell, dst: Cell, n: usize, tmp: Cell) {
         for i in 0..n {
             self.e.clear(dst + i as Cell);
             self.e.copy_cell(src + i as Cell, dst + i as Cell, tmp);

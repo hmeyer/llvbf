@@ -35,8 +35,11 @@ impl<'a> Gen<'a> {
         };
         let arg = self.lay.arg;
         let n = op.n;
-        self.transfer_operand(a, 0, arg, n)?;
-        self.transfer_operand(b, 0, arg + n as Cell, n)?;
+        // The scratch area is empty (zero) between segments: its first cell serves as
+        // the temporary for constant operands.
+        let tmp = self.lay.scratch;
+        self.transfer_operand(a, 0, arg, n, tmp)?;
+        self.transfer_operand(b, 0, arg + n as Cell, n, tmp)?;
         let req = self.arith_req(ArithKind::of(op.op).unwrap(), n);
         self.e.inc(req);
         self.set_pc(0, seg.id + 1);
@@ -49,7 +52,7 @@ impl<'a> Gen<'a> {
         let dest = bb.instrs[op.instr]
             .dest
             .ok_or_else(|| anyhow!("arithmetic without result"))?;
-        let (cell, size) = self.slot(dest)?;
+        let (cell, size) = self.define_slot(dest)?;
         let n = op.n;
         let arg = self.lay.arg;
         let (keep, drop) = if matches!(op.op, BinOp::URem | BinOp::SRem) {
@@ -57,9 +60,6 @@ impl<'a> Gen<'a> {
         } else {
             (arg, arg + n as Cell)
         };
-        for i in 0..size {
-            self.e.clear(cell + i as Cell);
-        }
         for i in 0..n.min(size) {
             self.e.move_cell(keep + i as Cell, cell + i as Cell);
         }

@@ -114,10 +114,7 @@ impl<'a> Gen<'a> {
     }
 
     fn getc(&mut self, dest: Value) -> Result<()> {
-        let (cell, size) = self.slot(dest)?;
-        for k in 0..size {
-            self.e.clear(cell + k as Cell);
-        }
+        let (cell, _) = self.define_slot(dest)?;
         // The cell is zero, so an interpreter that leaves it unchanged at EOF yields 0.
         self.e.input(cell);
         Ok(())
@@ -324,11 +321,8 @@ impl<'a> Gen<'a> {
     fn with_overflow(&mut self, inst: &Instr, args: &[&Operand], name: &str) -> Result<()> {
         let dest = inst.dest.unwrap();
         let n = limbs(self.op_bits(args[0])?);
-        let (cell, size) = self.slot(dest)?;
+        let (cell, _) = self.define_slot(dest)?;
         let (_, flag_off) = self.types().element(inst.ty, 1)?;
-        for k in 0..size {
-            self.e.clear(cell + k as Cell);
-        }
         let m = self.sc.mark();
         let ovf = self.sc.alloc(1);
         if name.starts_with("llvm.uadd.") {

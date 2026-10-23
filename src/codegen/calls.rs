@@ -12,10 +12,9 @@ impl<'a> Gen<'a> {
             _ => unreachable!(),
         };
         if let Some(dest) = inst.dest {
-            let (cell, size) = self.slot(dest)?;
+            let (cell, size) = self.define_slot(dest)?;
             let f = self.lay.frame;
             for k in 0..size {
-                self.e.clear(cell + k as Cell);
                 self.e
                     .move_cell(f + self.lay.ret + k as Cell, cell + k as Cell);
             }
@@ -48,17 +47,6 @@ impl<'a> Gen<'a> {
     }
 
     /// (offset, size) of each parameter in the parameter area, for a list of parameter types.
-    fn param_offsets(&self, tys: &[TypeId]) -> Vec<(usize, usize)> {
-        let mut v = Vec::new();
-        let mut off = 0;
-        for &t in tys {
-            let s = self.types().size(t);
-            v.push((off, s));
-            off += s;
-        }
-        v
-    }
-
     pub(super) fn emit_call(&mut self, bb: &Block, i: usize, seg: &Segment) -> Result<()> {
         let (callee, fn_ty, args) = match &bb.instrs[i].op {
             Op::Call {
@@ -129,13 +117,14 @@ impl<'a> Gen<'a> {
                 param_tys.len()
             );
         }
-        let offs = self.param_offsets(&param_tys);
-        let fixed_size: usize = offs.iter().map(|(_, s)| *s).sum();
+        let offs = param_offsets(self.types(), &param_tys);
+        let fixed_size: usize = offs.iter().map(|(_, s)| *s + 1).sum();
         args.truncate(param_tys.len());
         self.comment("call: pass arguments");
         for (k, arg) in args.iter().enumerate() {
             let (off, size) = offs[k];
-            self.transfer_operand(arg, 0, f + lay.params + off as Cell, size)?;
+            let dst = f + lay.params + off as Cell;
+            self.transfer_operand(arg, 0, dst, size, dst + size as Cell)?;
         }
         if variadic {
             // Hidden parameter: pointer to the spilled variadic arguments (current MSP).
@@ -143,7 +132,11 @@ impl<'a> Gen<'a> {
             let m = self.sc.mark();
             let w = Work::alloc(&mut self.sc, n);
             load_packed(&mut self.e, &mut self.sc, lay.msp, w);
-            self.store_to_cells(f + lay.params + fixed_size as Cell, n, w);
+            let dst = f + lay.params + fixed_size as Cell;
+            self.clear_slot(dst, n);
+            for i in 0..n {
+                self.e.move_cell(w.limb(i), dst + i as Cell);
+            }
             self.sc.release(m);
         }
         self.comment("call: set up callee frame");

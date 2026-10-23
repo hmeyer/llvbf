@@ -36,6 +36,12 @@ impl<'a> Gen<'a> {
                 .is_some_and(|v| v != *d && targets.contains(&v))
         });
         let m = self.sc.mark();
+        self.edge_moves = self
+            .fp()
+            .edge_moves
+            .get(&(from, to))
+            .cloned()
+            .unwrap_or_default();
         if hazard {
             let mut pending: Vec<(Value, Work)> = Vec::new();
             for (dest, val) in &edge {
@@ -52,6 +58,7 @@ impl<'a> Gen<'a> {
                 self.phi_copy(*dest, val)?;
             }
         }
+        self.edge_moves.clear();
         self.sc.release(m);
         let id = self.block_id(to);
         self.set_pc(0, id);
@@ -67,10 +74,8 @@ impl<'a> Gen<'a> {
                 let (scell, ssize) = self.slot(*v)?;
                 let n = size.min(ssize);
                 let movable = self.consume_use(*v);
-                for i in 0..size {
-                    self.e.clear(dcell + i as Cell);
-                }
-                let tmp = self.lay.copy_tmp;
+                self.clear_slot(dcell, size);
+                let tmp = scell + ssize as Cell;
                 for i in 0..n {
                     if movable {
                         self.e.move_cell(scell + i as Cell, dcell + i as Cell);
@@ -95,7 +100,8 @@ impl<'a> Gen<'a> {
                 } else {
                     self.ce().bytes(c, val.ty)?
                 };
-                let tmp = self.lay.copy_tmp;
+                let tmp = dcell + size as Cell;
+                self.clear_slot(dcell, size);
                 for (i, &b) in bytes.iter().enumerate().take(size) {
                     self.e.set_using(dcell + i as Cell, b, tmp);
                 }

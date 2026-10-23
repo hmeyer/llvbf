@@ -113,6 +113,11 @@ pub enum SlotKind {
     Local,
 }
 
+/// A slot holds the packed bytes of a value. Every slot is followed by a pad cell
+/// that is cleared when the value is defined and never written while it lives:
+/// copies out of the slot use it as their temporary, which makes a copy about as
+/// cheap as a move (the duplicate travels only one cell back instead of all the way
+/// from the destination).
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
     pub kind: SlotKind,
@@ -139,6 +144,10 @@ pub struct FuncPlan {
     /// its last use instead of copying it.
     pub instr_uses: HashMap<Value, usize>,
     pub term_uses: HashMap<Value, usize>,
+    /// Per CFG edge, the cross-block values that may be moved (rather than copied)
+    /// into the phis of the successor: they are read by exactly one of its phis and
+    /// are not live in the successor.
+    pub edge_moves: HashMap<(BlockId, BlockId), Vec<Value>>,
     pub locals_size: usize,
     pub pool_size: usize,
     pub params_size: usize,
@@ -322,26 +331,26 @@ fn plan_function(
     let types = &m.types;
     let mut slots: HashMap<Value, Slot> = HashMap::new();
     // Parameters.
-    let mut poff = 0usize;
-    for &p in &f.params {
-        let size = types.size(f.value_ty(p));
+    let param_tys: Vec<TypeId> = f.params.iter().map(|&p| f.value_ty(p)).collect();
+    let offs = param_offsets(types, &param_tys);
+    for (&p, &(off, size)) in f.params.iter().zip(&offs) {
         slots.insert(
             p,
             Slot {
                 kind: SlotKind::Param,
-                off: poff,
+                off,
                 size,
             },
         );
-        poff += size;
     }
+    let mut poff = offs.last().map(|(o, s)| o + s + 1).unwrap_or(0);
     let va_slot = if f.variadic {
         let s = Slot {
             kind: SlotKind::Param,
             off: poff,
             size: types.ptr_bytes,
         };
-        poff += types.ptr_bytes;
+        poff += types.ptr_bytes + 1;
         Some(s)
     } else {
         None
@@ -408,7 +417,7 @@ fn plan_function(
                         .get(&dest)
                         .and_then(|u| u.iter().map(|(_, p)| *p).max())
                         .unwrap_or(ii);
-                    let off = pool.alloc(size, end);
+                    let off = pool.alloc(size + 1, end);
                     slots.insert(
                         dest,
                         Slot {
@@ -427,7 +436,7 @@ fn plan_function(
                 _ => false,
             };
             if needs_extra {
-                let off = pool.alloc(types.ptr_bytes, ii);
+                let off = pool.alloc(types.ptr_bytes + 1, ii);
                 extra_slots.insert(
                     (bi, ii),
                     Slot {
@@ -440,7 +449,7 @@ fn plan_function(
         }
         pool_size = pool_size.max(pool.top);
     }
-    let loff = allocate_cross_block(f, types, &uses, &is_local, &mut slots);
+    let (loff, edge_moves) = allocate_cross_block(f, types, &uses, &is_local, &mut slots);
     let instr_uses: HashMap<Value, usize> = instr_uses
         .into_iter()
         .filter(|(v, _)| is_local(*v))
@@ -527,11 +536,24 @@ fn plan_function(
         va_slot,
         instr_uses,
         term_uses,
+        edge_moves,
         locals_size: loff,
         pool_size,
         params_size,
         ret_size,
     })
+}
+
+/// Offset and size of each parameter slot for the given parameter types.
+pub fn param_offsets(types: &TypeTable, tys: &[TypeId]) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    let mut off = 0;
+    for &t in tys {
+        let s = types.size(t);
+        v.push((off, s));
+        off += s + 1;
+    }
+    v
 }
 
 /// First-fit allocator of slots for values with known live intervals.
@@ -571,7 +593,8 @@ impl IntervalAllocator {
     }
 }
 
-/// Allocate dedicated slots for phis and cross-block values; returns the area size.
+/// Allocate dedicated slots for phis and cross-block values; returns the area size
+/// and the values each edge may move into the successor's phis.
 ///
 /// Blocks are laid out in order to give every instruction a position (a block of
 /// `k` instructions occupies `k + 1` positions, the last one for its terminator).
@@ -587,7 +610,7 @@ fn allocate_cross_block(
     uses: &HashMap<Value, Vec<(BlockId, usize)>>,
     is_local: &dyn Fn(Value) -> bool,
     slots: &mut HashMap<Value, Slot>,
-) -> usize {
+) -> (usize, HashMap<(BlockId, BlockId), Vec<Value>>) {
     let nb = f.blocks.len();
     let mut base = vec![0usize; nb];
     let mut pos = 0;
@@ -709,12 +732,31 @@ fn allocate_cross_block(
             }
         }
     }
+    // A phi input that is not live in the successor dies on the edge: move it.
+    let mut edge_moves: HashMap<(BlockId, BlockId), Vec<Value>> = HashMap::new();
+    for (b, bb) in f.blocks.iter().enumerate() {
+        let mut reads: HashMap<(BlockId, Value), usize> = HashMap::new();
+        for phi in &bb.phis {
+            for (val, pred) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    if def_pos.contains_key(&v) && !live_in[b].contains(&v) {
+                        *reads.entry((*pred, v)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        for ((pred, v), count) in reads {
+            if count == 1 {
+                edge_moves.entry((pred, b)).or_default().push(v);
+            }
+        }
+    }
     intervals.sort_unstable();
     let mut alloc = IntervalAllocator::default();
     for (start, end, v) in intervals {
         alloc.release_dead(start);
         let size = types.size(f.value_ty(v));
-        let off = alloc.alloc(size, end);
+        let off = alloc.alloc(size + 1, end);
         slots.insert(
             v,
             Slot {
@@ -724,7 +766,7 @@ fn allocate_cross_block(
             },
         );
     }
-    alloc.top
+    (alloc.top, edge_moves)
 }
 
 /// The SSA values an instruction reads.

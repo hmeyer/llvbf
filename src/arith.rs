@@ -98,10 +98,17 @@ pub fn load_const(e: &mut Emitter, w: Work, value: u64) {
 pub fn load_packed(e: &mut Emitter, sc: &mut Scratch, src: Cell, w: Work) {
     let m = sc.mark();
     let tmp = sc.alloc(1);
+    copy_packed(e, src, w, tmp);
+    sc.release(m);
+}
+
+/// Copy packed limbs at `src` into a zeroed work area using `tmp` (zero, left zero)
+/// as the temporary. A temporary next to the source makes the copy cost about the
+/// same as a move: the duplicate only travels one cell back.
+pub fn copy_packed(e: &mut Emitter, src: Cell, w: Work, tmp: Cell) {
     for i in 0..w.n {
         e.copy_cell(src + i as Cell, w.limb(i), tmp);
     }
-    sc.release(m);
 }
 
 /// Move a work area into packed limbs at `dst` (clearing dst first). `w` is zero afterwards.
@@ -113,14 +120,12 @@ pub fn store_packed(e: &mut Emitter, w: Work, dst: Cell) {
 }
 
 /// Copy a work area into another zeroed work area, non-destructively.
-pub fn copy_work(e: &mut Emitter, sc: &mut Scratch, src: Work, dst: Work) {
+pub fn copy_work(e: &mut Emitter, _sc: &mut Scratch, src: Work, dst: Work) {
     debug_assert!(dst.n <= src.n);
-    let m = sc.mark();
-    let tmp = sc.alloc(1);
+    // The zero cell after each source limb is the temporary.
     for i in 0..dst.n {
-        e.copy_cell(src.limb(i), dst.limb(i), tmp);
+        e.copy_cell(src.limb(i), dst.limb(i), src.limb(i) + 1);
     }
-    sc.release(m);
 }
 
 /// Move a work area into another (zeroed) work area. `src` is zero afterwards.

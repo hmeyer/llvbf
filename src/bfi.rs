@@ -208,6 +208,7 @@ impl Program {
         let n = ops.len();
         let max_steps = max_steps.unwrap_or(u64::MAX);
         let mut outbuf: Vec<u8> = Vec::new();
+        let mut trace: Vec<u32> = Vec::new();
         macro_rules! ensure {
             ($idx:expr) => {{
                 let idx = $idx;
@@ -226,13 +227,30 @@ impl Program {
             }
             if let Some(counts) = profile.as_deref_mut() {
                 counts[self.op_marker[pc] as usize] += 1;
+                // Keep the last distinct constructs for error reports.
+                let mk = self.op_marker[pc];
+                if trace.last() != Some(&mk) {
+                    trace.push(mk);
+                    if trace.len() > 12 {
+                        trace.remove(0);
+                    }
+                }
             }
             match &ops[pc] {
                 Op::Add(d) => tape[p] = tape[p].wrapping_add(*d),
                 Op::Move(m) => {
                     let np = p as isize + *m;
                     if np < 0 {
-                        bail!("head moved left of cell 0 (pc={})", pc);
+                        bail!(
+                            "head moved left of cell 0 (pc={}, in {}; recent: {})",
+                            pc,
+                            self.markers[self.op_marker[pc] as usize],
+                            trace
+                                .iter()
+                                .map(|&m| self.markers[m as usize].clone())
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        );
                     }
                     p = np as usize;
                     ensure!(p);
@@ -272,7 +290,16 @@ impl Program {
                         for (off, f) in terms {
                             let idx = p as isize + *off;
                             if idx < 0 {
-                                bail!("head moved left of cell 0 (pc={})", pc);
+                                bail!(
+                                    "head moved left of cell 0 (pc={}, in {}; recent: {})",
+                                    pc,
+                                    self.markers[self.op_marker[pc] as usize],
+                                    trace
+                                        .iter()
+                                        .map(|&m| self.markers[m as usize].clone())
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                );
                             }
                             let idx = idx as usize;
                             ensure!(idx);
@@ -285,7 +312,16 @@ impl Program {
                     while tape[p] != 0 {
                         let np = p as isize + *stride;
                         if np < 0 {
-                            bail!("head moved left of cell 0 (pc={})", pc);
+                            bail!(
+                                "head moved left of cell 0 (pc={}, in {}; recent: {})",
+                                pc,
+                                self.markers[self.op_marker[pc] as usize],
+                                trace
+                                    .iter()
+                                    .map(|&m| self.markers[m as usize].clone())
+                                    .collect::<Vec<_>>()
+                                    .join(" | ")
+                            );
                         }
                         p = np as usize;
                         ensure!(p);
