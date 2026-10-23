@@ -1,0 +1,6 @@
+/target
+*.bf
+*.bc
+*.ll
+!examples/**/*.ll
+/examples/**/out/
