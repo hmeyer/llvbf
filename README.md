@@ -83,10 +83,12 @@ C ──clang──▶ LLVM IR ──llvm-link/opt──▶ one module ──pla
 * `ir.rs` is the *snapshot IR*: a plain, owned, lifetime-free Rust model of exactly what the
   lowering consumes (interned types with sizes and offsets, typed operands, constants with
   pre-folded `getelementptr` offsets, instructions as a `match`-able enum).
-* `loader.rs` builds it from an LLVM module with `inkwell`, using the LLVM C API for the details
-  `inkwell` does not expose. It is the only module with `unsafe` code and the only place that
-  changes when LLVM does; constructs the backend cannot lower are rejected here with the LLVM
-  text of the offending value.
+* `loader/` builds it from an LLVM module through `inkwell`'s safe API. The five things `inkwell`
+  does not expose (switch case values, constant expressions, array constant elements, metadata
+  arguments, the function type of an indirect call) are wrapped in `loader/raw.rs`, the only
+  `unsafe` code in the crate; each wrapper checks its preconditions and documents what it relies
+  on. The loader is the only place that changes when LLVM does, and constructs the backend cannot
+  lower are rejected here with the LLVM text of the offending value.
 * `plan.rs` assigns a 16-bit id to every *segment* (see below), a frame slot to every SSA value and
   an address to every global.
 * `emit.rs` is the Brainfuck emitter with position tracking and the constant-time `if_zero` idiom.
