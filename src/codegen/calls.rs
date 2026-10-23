@@ -135,15 +135,7 @@ impl<'a> Gen<'a> {
         self.comment("call: pass arguments");
         for (k, arg) in args.iter().enumerate() {
             let (off, size) = offs[k];
-            let m = self.sc.mark();
-            let w = Work::alloc(&mut self.sc, size);
-            if self.types().is_scalar(param_tys[k]) {
-                self.load_operand(arg, w)?;
-            } else {
-                self.load_operand_bytes(arg, 0, w)?;
-            }
-            self.store_to_cells(f + lay.params + off as Cell, size, w);
-            self.sc.release(m);
+            self.transfer_operand(arg, 0, f + lay.params + off as Cell, size)?;
         }
         if variadic {
             // Hidden parameter: pointer to the spilled variadic arguments (current MSP).

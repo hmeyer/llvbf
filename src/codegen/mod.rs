@@ -84,7 +84,12 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Frame layout: control header, return value, parameters, pooled slots, scratch,
+    /// dedicated slots. The pooled slots hold most operands and sit between the
+    /// control header (memory requests, pc) and the scratch area every arithmetic
+    /// operand passes through, so the common copies are short.
     fn new(plan: &Plan, ptr_bytes: usize, scratch_size: usize) -> Layout {
+        // Control header first (it is mirrored by the control area of memory blocks).
         let active = 0;
         let home = 1; // pads at 2, 3
         let nothome = 4;
@@ -102,6 +107,8 @@ impl Layout {
         let data = t + 1;
         let ctl = data + 8;
         let msp = ctl;
+        // Then the return value, parameters, the pooled slots, the scratch area the
+        // pooled slots feed, and the dedicated slots.
         let ret = msp + ptr_bytes as Cell;
         let params = ret + plan.ret_max as Cell;
         let pool = params + plan.params_max as Cell;
@@ -354,6 +361,48 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Copy (or, on its last use, move) bytes `off..off+n` of an operand straight into
+    /// `n` consecutive cells at `dst`, which are cleared first. Used where a value only
+    /// needs to change place (arguments, memory requests), to avoid the detour through
+    /// scratch. Constants are set in place.
+    fn transfer_operand(&mut self, op: &Operand, off: usize, dst: Cell, n: usize) -> Result<()> {
+        for i in 0..n {
+            self.e.clear(dst + i as Cell);
+        }
+        match &op.kind {
+            OperandKind::Value(v) => {
+                let (cell, size) = self.slot(*v)?;
+                let avail = size.saturating_sub(off).min(n);
+                let movable = self.consume_use(*v);
+                let tmp = self.lay.copy_tmp;
+                for i in 0..avail {
+                    if movable {
+                        self.e.move_cell(cell + (off + i) as Cell, dst + i as Cell);
+                    } else {
+                        self.e
+                            .copy_cell(cell + (off + i) as Cell, dst + i as Cell, tmp);
+                    }
+                }
+            }
+            OperandKind::Const(c) => {
+                let bytes = if self.types().is_scalar(op.ty) {
+                    let x = self.ce().operand_scalar(op)?;
+                    (0..8)
+                        .map(|i| ((x >> (8 * i)) & 0xff) as u8)
+                        .collect::<Vec<u8>>()
+                } else {
+                    self.ce().bytes(c, op.ty)?
+                };
+                let tmp = self.lay.copy_tmp;
+                for i in 0..n {
+                    let b = bytes.get(off + i).copied().unwrap_or(0);
+                    self.e.set_using(dst + i as Cell, b, tmp);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Store a work area into the slot of `v`, clearing the whole slot first.
     fn store_result(&mut self, v: Value, w: Work) -> Result<()> {
         let (cell, size) = self.slot(v)?;
@@ -397,8 +446,17 @@ impl<'a> Gen<'a> {
     fn emit_program(&mut self) -> Result<()> {
         let lay = self.lay.clone();
         self.comment(&format!(
-            "llvbf output: {} memory blocks of {} cells, frame size {}, {} dispatch blocks",
-            lay.num_blocks, lay.block, lay.frame, self.plan.num_ids
+            "llvbf output: {} memory blocks of {} cells, frame size {} (control {}, ret {}, params {}, pool {}, scratch {}, locals {}), {} dispatch blocks",
+            lay.num_blocks,
+            lay.block,
+            lay.frame,
+            lay.ret,
+            self.plan.ret_max,
+            self.plan.params_max,
+            self.plan.pool_max,
+            lay.scratch_size,
+            self.plan.locals_max,
+            self.plan.num_ids
         ));
         // Initialize global data (absolute addressing from tape cell 0).
         self.comment("initialize global data");

@@ -52,45 +52,78 @@ impl<'a> Gen<'a> {
             a.off,
             a.role
         ));
-        let m = self.sc.mark();
         // Address: which operand holds the base pointer depends on the role.
-        let w = Work::alloc(&mut self.sc, n);
-        match (a.role, &inst.op) {
+        let addr_op: Option<&Operand> = match (a.role, &inst.op) {
             (AccessRole::Plain, Op::Load { addr, .. })
-            | (AccessRole::Plain, Op::Store { addr, .. }) => self.load_operand(addr, w)?,
+            | (AccessRole::Plain, Op::Store { addr, .. }) => Some(addr),
             (AccessRole::VaPtrLoad, Op::VaArg { list })
-            | (AccessRole::VaPtrStore, Op::VaArg { list }) => self.load_operand(list, w)?,
-            (AccessRole::VaValue, _) => {
-                let (cell, _) = self.extra_slot(block, a.instr)?;
-                load_packed(&mut self.e, &mut self.sc, cell, w);
-            }
+            | (AccessRole::VaPtrStore, Op::VaArg { list }) => Some(list),
             (AccessRole::VaStart, Op::Call { args, .. })
-            | (AccessRole::VaCopyStore, Op::Call { args, .. }) => self.load_operand(&args[0], w)?,
-            (AccessRole::VaCopyLoad, Op::Call { args, .. }) => self.load_operand(&args[1], w)?,
-            (AccessRole::VaSpill(_), _) => load_packed(&mut self.e, &mut self.sc, lay.msp, w),
+            | (AccessRole::VaCopyStore, Op::Call { args, .. }) => Some(&args[0]),
+            (AccessRole::VaCopyLoad, Op::Call { args, .. }) => Some(&args[1]),
+            (AccessRole::VaValue, _) | (AccessRole::VaSpill(_), _) => None,
             _ => bail!("internal error: access role does not match instruction"),
+        };
+        let addr_cells = [lay.addr_lo, lay.addr_hi];
+        match (addr_op, a.off) {
+            (Some(op), 0) => {
+                // Straight from the slot into the request cells (the high limbs of a
+                // 32-bit pointer are not addressable and are dropped).
+                self.transfer_operand(op, 0, lay.addr_lo, 1)?;
+                if n > 1 {
+                    self.transfer_operand(op, 1, lay.addr_hi, 1)?;
+                }
+            }
+            _ => {
+                let m = self.sc.mark();
+                let w = Work::alloc(&mut self.sc, n);
+                match addr_op {
+                    Some(op) => self.load_operand(op, w)?,
+                    None if a.role == AccessRole::VaValue => {
+                        let (cell, _) = self.extra_slot(block, a.instr)?;
+                        load_packed(&mut self.e, &mut self.sc, cell, w);
+                    }
+                    None => load_packed(&mut self.e, &mut self.sc, lay.msp, w),
+                }
+                if a.off != 0 {
+                    add_const(&mut self.e, &mut self.sc, w, a.off as u64);
+                }
+                for (i, &c) in addr_cells.iter().enumerate().take(n.min(2)) {
+                    self.e.clear(c);
+                    self.e.move_cell(w.limb(i), c);
+                }
+                clear_work(&mut self.e, w);
+                self.sc.release(m);
+            }
         }
-        if a.off != 0 {
-            add_const(&mut self.e, &mut self.sc, w, a.off as u64);
-        }
-        self.e.clear(lay.addr_lo);
-        self.e.clear(lay.addr_hi);
-        self.e.move_cell(w.limb(0), lay.addr_lo);
-        if w.n > 1 {
-            self.e.move_cell(w.limb(1), lay.addr_hi);
-        }
-        clear_work(&mut self.e, w);
-        self.sc.release(m);
         // Data for stores.
         if a.is_store {
-            let m = self.sc.mark();
-            let dw = Work::alloc(&mut self.sc, a.width);
             match (a.role, &inst.op) {
                 (AccessRole::Plain, Op::Store { value, .. }) => {
-                    self.load_operand_bytes(value, a.off, dw)?
+                    self.transfer_operand(value, a.off, lay.data, a.width)?;
+                }
+                (AccessRole::VaSpill(k), Op::Call { fn_ty, args, .. }) => {
+                    let (layout, _) = va_spill_layout(self.types(), *fn_ty, args)?;
+                    let fixed = args.len() - layout.len();
+                    let (aoff, _) = layout[k];
+                    let arg = &args[fixed + k];
+                    self.transfer_operand(arg, a.off - aoff, lay.data, a.width)?;
+                }
+                (AccessRole::VaStart, _) => {
+                    let s = self
+                        .fp()
+                        .va_slot
+                        .ok_or_else(|| anyhow!("va_start in non-variadic function"))?;
+                    let cell = self.slot_cell(&s);
+                    self.copy_cells(cell + a.off as Cell, lay.data, a.width);
+                }
+                (AccessRole::VaCopyStore, _) => {
+                    let (cell, _) = self.extra_slot(block, a.instr)?;
+                    self.copy_cells(cell + a.off as Cell, lay.data, a.width);
                 }
                 (AccessRole::VaPtrStore, _) => {
                     // The advanced argument pointer: saved pointer + size of the argument slot.
+                    let m = self.sc.mark();
                     let (cell, _) = self.extra_slot(block, a.instr)?;
                     let full = Work::alloc(&mut self.sc, n);
                     load_packed(&mut self.e, &mut self.sc, cell, full);
@@ -100,48 +133,28 @@ impl<'a> Gen<'a> {
                     }
                     add_const(&mut self.e, &mut self.sc, full, adv as u64);
                     for k in 0..a.width {
-                        self.e.move_cell(full.limb(a.off + k), dw.limb(k));
+                        self.e.clear(lay.data + k as Cell);
+                        self.e.move_cell(full.limb(a.off + k), lay.data + k as Cell);
                     }
                     clear_work(&mut self.e, full);
-                }
-                (AccessRole::VaStart, _) => {
-                    let s = self
-                        .fp()
-                        .va_slot
-                        .ok_or_else(|| anyhow!("va_start in non-variadic function"))?;
-                    let cell = self.slot_cell(&s);
-                    load_packed(&mut self.e, &mut self.sc, cell + a.off as Cell, dw);
-                }
-                (AccessRole::VaCopyStore, _) => {
-                    let (cell, _) = self.extra_slot(block, a.instr)?;
-                    load_packed(&mut self.e, &mut self.sc, cell + a.off as Cell, dw);
-                }
-                (AccessRole::VaSpill(k), Op::Call { fn_ty, args, .. }) => {
-                    let (layout, _) = va_spill_layout(self.types(), *fn_ty, args)?;
-                    let fixed = args.len() - layout.len();
-                    let (aoff, _) = layout[k];
-                    let arg = &args[fixed + k];
-                    if self.types().is_scalar(arg.ty)
-                        && a.off == aoff
-                        && a.width >= self.types().size(arg.ty)
-                    {
-                        self.load_operand(arg, dw)?;
-                    } else {
-                        self.load_operand_bytes(arg, a.off - aoff, dw)?;
-                    }
+                    self.sc.release(m);
                 }
                 _ => bail!("internal error: store role does not match instruction"),
             }
-            for k in 0..a.width {
-                self.e.clear(lay.data + k as Cell);
-                self.e.move_cell(dw.limb(k), lay.data + k as Cell);
-            }
-            self.sc.release(m);
         }
         let req = lay.req + self.access_kind_index(a.is_store, a.width);
         self.e.set(req, 1);
         self.set_pc(0, seg.id + 1);
         Ok(())
+    }
+
+    /// Copy `n` cells from `src` to `dst` (cleared first) through the copy temporary.
+    fn copy_cells(&mut self, src: Cell, dst: Cell, n: usize) {
+        let tmp = self.lay.copy_tmp;
+        for i in 0..n {
+            self.e.clear(dst + i as Cell);
+            self.e.copy_cell(src + i as Cell, dst + i as Cell, tmp);
+        }
     }
 
     /// Move the given cells to the same offsets in the region `stride` cells away
