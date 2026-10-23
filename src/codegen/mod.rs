@@ -168,7 +168,7 @@ struct Gen<'a> {
 
 /// Compile a module to Brainfuck.
 pub fn compile(m: &Module, opts: &Options) -> Result<Vec<u8>> {
-    if opts.mem_size % 256 != 0 || opts.mem_size == 0 || opts.mem_size > 65536 {
+    if !opts.mem_size.is_multiple_of(256) || opts.mem_size == 0 || opts.mem_size > 65536 {
         bail!("memory size must be a positive multiple of 256 and at most 65536");
     }
     let plan = plan_module(m, opts.mem_size, &opts.entry)?;

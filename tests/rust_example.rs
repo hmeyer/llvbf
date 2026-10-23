@@ -56,8 +56,10 @@ fn rust_example() {
         }
     }
     let ll = ll.expect("no .ll produced by the nightly build");
-    let mut opts = llvbf::driver::CcOptions::default();
-    opts.sources = vec![ll];
+    let opts = llvbf::driver::CcOptions {
+        sources: vec![ll],
+        ..Default::default()
+    };
     let code = match llvbf::driver::cc(&opts) {
         Ok(c) => c,
         Err(e) => {

@@ -77,7 +77,7 @@ impl Work {
 
 /// Number of limbs for an integer of the given bit width.
 pub fn limbs(bits: u32) -> usize {
-    ((bits + 7) / 8) as usize
+    bits.div_ceil(8) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +810,7 @@ pub fn sext_work(e: &mut Emitter, sc: &mut Scratch, src: Work, dst: Work) {
 /// Sign-extend a value whose meaningful width is `bits` (e.g. 1 for i1) that is stored
 /// zero-extended in `src`. Result in zeroed `dst`.
 pub fn sext_bits(e: &mut Emitter, sc: &mut Scratch, src: Work, bits: u32, dst: Work) {
-    if bits % 8 == 0 {
+    if bits.is_multiple_of(8) {
         sext_work(e, sc, src, dst);
         return;
     }
@@ -835,7 +835,7 @@ pub fn trunc_bits(e: &mut Emitter, sc: &mut Scratch, w: Work, bits: u32) {
     for i in n..w.n {
         e.clear(w.limb(i));
     }
-    if bits % 8 != 0 {
+    if !bits.is_multiple_of(8) {
         let mask = (1u64 << bits) - 1;
         bitwise_const(e, sc, w.truncated(n), mask, 0);
     }

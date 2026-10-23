@@ -12,8 +12,10 @@ fn root() -> PathBuf {
 }
 
 fn run_example(name: &str, input: &[u8]) -> String {
-    let mut opts = llvbf::driver::CcOptions::default();
-    opts.sources = vec![root().join("examples").join(format!("{}.c", name))];
+    let opts = llvbf::driver::CcOptions {
+        sources: vec![root().join("examples").join(format!("{}.c", name))],
+        ..Default::default()
+    };
     let code = llvbf::driver::cc(&opts).unwrap_or_else(|e| panic!("compiling {}: {:#}", name, e));
     let src = String::from_utf8(code).unwrap();
     let prog = llvbf::bfi::Program::parse(&src).unwrap();
