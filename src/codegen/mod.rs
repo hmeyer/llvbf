@@ -86,21 +86,26 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Frame layout: control header, return value, parameters, pooled slots, scratch,
-    /// dedicated slots. The pooled slots hold most operands and sit between the
-    /// control header (memory requests, pc) and the scratch area every arithmetic
-    /// operand passes through, so the common copies are short.
+    /// Frame layout: return value, parameters, control header, pooled slots,
+    /// arithmetic request cells, scratch, dedicated slots.
     fn new(plan: &Plan, ptr_bytes: usize, scratch_size: usize) -> Layout {
-        // Control header first (it is mirrored by the control area of memory blocks).
-        let active = 0;
-        let home = 1; // pads at 2, 3
-        let nothome = 4;
-        let pc_lo = 5;
-        let pc_hi = 6;
-        let ch_lo = 7; // pads 8, 9
-        let ch_hi = 10; // pads 11, 12
-        let tmp = 13;
-        let req = 14;
+        // Return value and parameters first: parameters at the frame start keep the
+        // caller's argument moves (into the next frame) short.
+        let ret = 0;
+        let params = ret + plan.ret_max as Cell;
+        // The control header follows. Every segment starts and ends in it (dispatch,
+        // pc) and memory requests pass through it, so it sits next to the pooled
+        // slots and the scratch area rather than at the frame start. The control
+        // area of each memory block mirrors the frame up to and including the header.
+        let active = params + plan.params_max as Cell;
+        let home = active + 1; // pads at +1, +2
+        let nothome = home + 3;
+        let pc_lo = nothome + 1;
+        let pc_hi = pc_lo + 1;
+        let ch_lo = pc_hi + 1; // pads +1, +2
+        let ch_hi = ch_lo + 3; // pads +1, +2
+        let tmp = ch_hi + 3;
+        let req = tmp + 1;
         let num_req = plan.access_kinds.len() + plan.arith_kinds.len();
         let addr_hi = req + num_req.max(1) as Cell;
         let hops = addr_hi + 1;
@@ -110,11 +115,10 @@ impl Layout {
         let data = t + 1;
         let ctl = data + 8;
         let msp = ctl;
-        // Then the return value, parameters, the pooled slots, the scratch area the
-        // pooled slots feed, and the dedicated slots.
-        let ret = msp + ptr_bytes as Cell;
-        let params = ret + plan.ret_max as Cell;
-        let pool = params + plan.params_max as Cell;
+        // Then the pooled slots, the arithmetic request cells, the scratch area and
+        // the dedicated slots: the scratch area, which every operand passes through,
+        // sits between the two slot areas.
+        let pool = msp + ptr_bytes as Cell;
         let arg = pool + plan.pool_max as Cell;
         let scratch = arg + plan.arg_size as Cell;
         let locals = scratch + scratch_size as Cell;
@@ -501,7 +505,7 @@ impl<'a> Gen<'a> {
             lay.num_blocks,
             lay.block,
             lay.frame,
-            lay.ret,
+            lay.pool - lay.active,
             self.plan.ret_max,
             self.plan.params_max,
             self.plan.pool_max,
