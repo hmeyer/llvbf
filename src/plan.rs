@@ -214,16 +214,28 @@ fn call_ends_segment(callee: &Callee) -> Result<bool> {
     }
 }
 
-/// Size of a variadic argument slot in the spill area (rounded up to 2 bytes).
-pub fn va_slot_size(size: usize) -> usize {
-    size.div_ceil(2) * 2
+fn round_up(x: usize, a: usize) -> usize {
+    x.div_ceil(a) * a
+}
+
+/// Size and alignment of a variadic argument's slot in the spill area: slots are
+/// pointer-sized, and arguments with a larger alignment are aligned to at most two
+/// pointers. This is what clang's inline `va_arg` expansion assumes on 32-bit
+/// targets (4-byte slots, 8-byte alignment for 64-bit values); on the 16-bit target
+/// llvbf lowers `va_arg` itself with the same rule.
+pub fn va_slot(types: &TypeTable, ty: TypeId) -> (usize, usize) {
+    let ptr = types.ptr_bytes;
+    let size = round_up(types.size(ty), ptr);
+    let align = types.align(ty).max(ptr).min(2 * ptr);
+    (size, align)
 }
 
 pub fn call_is_variadic(types: &TypeTable, fn_ty: TypeId) -> bool {
     matches!(types.kind(fn_ty), TypeKind::Func { variadic: true, .. })
 }
 
-/// Byte offsets and sizes of the variadic arguments of a call, and the total area size.
+/// Byte offsets and sizes of the variadic arguments of a call, and the total area
+/// size (a multiple of two pointers, so the memory stack pointer stays aligned).
 pub fn va_spill_layout(
     types: &TypeTable,
     fn_ty: TypeId,
@@ -233,11 +245,12 @@ pub fn va_spill_layout(
     let mut v = Vec::new();
     let mut off = 0;
     for a in args.iter().skip(params.len()) {
-        let size = types.size(a.ty);
-        v.push((off, size));
-        off += va_slot_size(size);
+        let (slot_size, slot_align) = va_slot(types, a.ty);
+        off = round_up(off, slot_align);
+        v.push((off, types.size(a.ty)));
+        off += slot_size;
     }
-    Ok((v, off))
+    Ok((v, round_up(off, 2 * types.ptr_bytes)))
 }
 
 fn access_align(types: &TypeTable, ty: TypeId, align: usize) -> usize {

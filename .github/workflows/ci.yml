@@ -24,13 +24,12 @@ jobs:
           sudo apt-get install -y clang-23 llvm-23 llvm-23-dev libpolly-23-dev libzstd-dev
           /usr/lib/llvm-23/bin/llvm-config --version
 
-      - name: Install Rust (stable + nightly with rust-src for the Rust example)
+      - name: Install Rust (stable, plus the riscv32 target for the Rust example)
         run: |
           rustup toolchain install stable --profile minimal -c rustfmt -c clippy
           rustup default stable
-          rustup toolchain install nightly --profile minimal -c rust-src
+          rustup target add riscv32i-unknown-none-elf
           rustc -vV
-          rustc +nightly -vV
 
       - uses: Swatinem/rust-cache@v2
 

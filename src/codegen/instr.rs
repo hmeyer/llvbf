@@ -352,7 +352,9 @@ impl<'a> Gen<'a> {
             bail!("alloca outside the entry block (dynamic allocation) is not supported");
         }
         let size = self.types().size(ty) as u64 * count;
-        let align = (align as u64).max(2);
+        // Keep the memory stack pointer aligned to two pointers (variadic spill
+        // areas rely on it).
+        let align = (align as u64).max(2 * self.ptr_limbs() as u64);
         let size = size.div_ceil(align) * align;
         let n = self.ptr_limbs();
         let m = self.sc.mark();

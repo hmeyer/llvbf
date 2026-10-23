@@ -3,15 +3,14 @@
 This crate is a `no_std` program that only talks to the outside world through
 the three llvbf hooks (`__llvbf_putc`, `__llvbf_getc`, `__llvbf_exit`).
 
-Requirements: a Rust nightly whose LLVM major version matches llvbf's (LLVM 23
-at the time of writing; check `rustc +nightly -vV`), with the `rust-src`
-component so that `core` can be built for the 16-bit `msp430-none-elf` target.
+Requirements: stable Rust with the `riscv32i-unknown-none-elf` target (a Tier 2
+target with a precompiled `core`), and a rustc whose LLVM is not newer than the
+one llvbf is built against (`rustc -vV` shows it; llvbf uses LLVM 23).
 
 ```
-rustup toolchain install nightly -c rust-src
-cargo +nightly rustc --release --target msp430-none-elf \
-      -Zbuild-std=core,compiler_builtins -- --emit=llvm-ir
-llvbf cc target/msp430-none-elf/release/deps/bf_rust_example-*.ll -o rust.bf
+rustup target add riscv32i-unknown-none-elf
+cargo rustc --release --target riscv32i-unknown-none-elf -- --emit=llvm-ir
+llvbf cc target/riscv32i-unknown-none-elf/release/deps/bf_rust_example-*.ll -o rust.bf
 llvbf run rust.bf
 ```
 
@@ -22,6 +21,6 @@ symbols left are the llvbf hooks and the `llvm.memset` intrinsic, which
 `llvbf cc` resolves by linking its C runtime. `-C panic=abort` keeps unwinding
 out of the picture; the `#[panic_handler]` prints `panic` and exits.
 
-A 32-bit build (`--target i686-unknown-linux-gnu`, no `build-std` needed) also
-works: link the runtime with `llvbf cc --target i686-unknown-none ...`.
-Arithmetic is then four limbs wide instead of two.
+The 16-bit mode also works, but needs a nightly with `rust-src`:
+`cargo +nightly rustc --release --target msp430-none-elf -Zbuild-std=core,compiler_builtins -- --emit=llvm-ir`,
+then `llvbf cc --target msp430 ...`. Arithmetic is two limbs wide instead of four.

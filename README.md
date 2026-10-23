@@ -3,9 +3,9 @@
 [![CI](https://github.com/hmeyer/llvbf/actions/workflows/ci.yml/badge.svg)](https://github.com/hmeyer/llvbf/actions/workflows/ci.yml)
 
 `llvbf` compiles LLVM IR to Brainfuck. Anything that can be lowered to LLVM IR
-with a 16-bit (or 32-bit) pointer target can therefore be compiled to
-Brainfuck; the bundled driver does this for C with `clang`, and
-[`examples/rust`](examples/rust) shows how to do it for Rust.
+for a 32-bit (or 16-bit) target without floating point can therefore be
+compiled to Brainfuck; the bundled driver does this for C with `clang`, and
+[`examples/rust`](examples/rust) shows how to do it for Rust on stable.
 
 ```
 $ cat hello.c
@@ -36,8 +36,9 @@ Working:
   `stdlib.h` (bump `malloc`, `exit`, `atoi`, `strtol`, `rand`, `qsort`), `ctype.h`, `assert.h`.
 
 Not supported: floating point, vectors, atomics, exceptions, dynamic `alloca`, inline assembly,
-external globals. Memory is at most 64 KiB. End of input is reported as `0` (or `255` on
-interpreters that use -1), which the runtime maps to `EOF`.
+external globals. Memory is at most 64 KiB (pointers are 32 bits wide but only the low 16 are
+used for addressing). End of input is reported as `0` (or `255` on interpreters that use -1),
+which the runtime maps to `EOF`.
 
 ## Building
 
@@ -64,12 +65,14 @@ llvbf compile <input.ll|input.bc> -o out.bf [--mem-size N] [--comments] [--entry
 llvbf run <program.bf> [--stats]
 ```
 
-`llvbf cc` runs `clang -target msp430 -Os -ffreestanding` on each source and on the runtime in
-`runtime/`, links everything with `llvm-link`, runs `opt` (internalize + `-Os` + dead code
-elimination) and lowers the result. `llvbf compile` takes IR produced any other way; the only
-requirements are a data layout with 16-bit pointers (32-bit works, but only the first 64 KiB of
-the address space exist) and no floating point. `--comments` annotates the output with the IR it
-came from, which is the main debugging aid.
+`llvbf cc` runs `clang -target riscv32-unknown-elf -Os -ffreestanding` on each source and on the
+runtime in `runtime/`, links everything with `llvm-link`, runs `opt` (internalize + O2 with
+clang's size attributes + dead code elimination) and lowers the result. `--target msp430` selects
+the **16-bit mode**: `int` and pointers are 16 bits, which halves the arithmetic and makes the
+output about 2.2x smaller, at the price of every program's assumption that `int` holds 100000.
+`llvbf compile` takes IR produced any other way; the only requirements are 16- or 32-bit pointers
+(only the first 64 KiB of the address space exist) and no floating point. `--comments` annotates
+the output with the IR it came from, which is the main debugging aid.
 
 `llvbf run` is an optimizing interpreter: it executes `[-]`, balanced multiply/move loops and
 scan loops in constant time. The generated code relies on this heavily (see Performance).
@@ -165,9 +168,10 @@ own `PC` to the continuation, and shifts. `ret` writes the value into its own `R
 destination slot. Recursion needs nothing special. A synthetic start frame calls the entry function
 and clears its `ACTIVE` when it returns, which ends the main loop.
 
-Variadic arguments are spilled by the caller into the memory stack (2-byte slots, as the msp430 ABI
-expects) and a hidden pointer parameter is passed; `va_start` stores it and `va_arg` is three
-ordinary memory accesses.
+Variadic arguments are spilled by the caller into the memory stack in pointer-sized slots (aligned
+to at most two pointers, which is what clang's inline `va_arg` expansion assumes on 32-bit
+targets) and a hidden pointer parameter is passed. `va_start` stores it; on the 16-bit target,
+where clang emits the `va_arg` instruction, llvbf lowers it to three ordinary memory accesses.
 
 ### Memory accesses
 
@@ -196,26 +200,29 @@ unit-tested against native arithmetic (`cargo test`).
 
 ## Rust (and other frontends)
 
-Any LLVM frontend works if it can target 16-bit pointers and emit a module with no floats.
-For Rust, `examples/rust` is a `no_std` crate built with a nightly, `-Zbuild-std=core` for
-`msp430-none-elf`, `panic = "abort"` and `lto = "fat"`; the LTO'd `--emit=llvm-ir` output is
-self-contained and `llvbf cc` links the C runtime for `memset`. The nightly's LLVM must not be
-newer than llvbf's (`rustc +nightly -vV` shows it). `cargo test` runs this example when such a
-nightly is installed and skips it otherwise.
+Any LLVM frontend works if it can target 32-bit (or 16-bit) pointers and emit a module with no
+floats. For Rust, `examples/rust` is a `no_std` crate built on **stable** for the Tier 2 target
+`riscv32i-unknown-none-elf` with `panic = "abort"` and `lto = "fat"`; the LTO'd `--emit=llvm-ir`
+output is self-contained and `llvbf cc` links the C runtime for `memset`. rustc's LLVM must not be
+newer than llvbf's (`rustc -vV` shows it). `cargo test` runs this example when the target is
+installed and skips it otherwise.
 
 ## Performance
 
-Numbers for the examples, compiled with `-Os` and run with `llvbf run`:
+Numbers for the examples, compiled with `-Os` and run with `llvbf run`, for the default 32-bit
+target and the 16-bit mode:
 
-| program | Brainfuck size | ops executed |
+| program | riscv32 size / ops | msp430 size / ops |
 |---|---|---|
-| hello (printf) | 4.5 MB | 1.3 M |
-| fib(0..15), recursive | 4.6 MB | 66 M |
-| sieve to 200 | 4.6 MB | 45 M |
+| fib(0..15), recursive, printf | 10.3 MB / 103 M | 4.6 MB / 66 M |
+| bubble sort | 10.3 MB / 9.5 M | 4.6 MB / 7.3 M |
+| strings | 11.4 MB / 17.5 M | 5.0 MB / 14.8 M |
+| sieve to 200 | 10.3 MB / 56 M | 4.6 MB / 43 M |
 
 Almost all of the size is head movement (`>>>…`) between frame slots and scratch, because every
 SSA value has its own slot and frames are several hundred cells wide. Almost all of the time is
-spent in the carry loops of multi-limb arithmetic and in the dispatch chain.
+spent in the carry loops of multi-limb arithmetic and in the dispatch chain; the 32-bit target
+doubles the limb count but only costs 1.2–1.6x in executed operations.
 
 The code assumes an interpreter that runs balanced loops such as `[->>>+<<<]` in constant time.
 On a naive interpreter every copy costs time proportional to the value times the distance, and
@@ -256,9 +263,11 @@ instructions) models a register machine with jumps. Brainfuck has neither, so a 
 emit an assembly language that still needs everything in this repository to become Brainfuck.
 Consuming IR directly is simpler and is what every working esolang backend does.
 
-Why `msp430` as the C target? It is the only in-tree clang target with 16-bit `int` and 16-bit
-pointers and no vector units, which keeps arithmetic at two limbs. Any target works as long as the
-IR has no floats; `-target i386` gives 32-bit `int` and roughly four times slower arithmetic.
+Why `riscv32` as the default C target? Its `int` is 32 bits, so existing C and Rust code behaves
+as written (the 16-bit `int` of msp430 is a reliable source of "compiler bugs" that are not), its
+data layout is plain, it is a first-class backend in LLVM, clang, Rust and Zig, and Rust ships a
+precompiled `core` for it, so Rust programs compile on stable. msp430 stays available as the
+16-bit mode for anyone who wants the smaller and faster output.
 
 ## Future work
 
@@ -266,7 +275,7 @@ IR has no floats; `-target i386` gives 32-bit `int` and roughly four times slowe
   the output size by an order of magnitude; the first version deliberately keeps one slot per value.
 * Structured control flow (relooper) for loops inside a function would avoid the dispatch chain
   for the hottest edges.
-* 16-bit cell mode (one limb per `int`).
+* Exploit the known-zero upper limbs of 32-bit pointers (the address space is 64 KiB).
 * Other frontends: Zig and C++ (without exceptions and RTTI) should work like Rust does; the
   runtime hooks are just `__llvbf_putc`, `__llvbf_getc` and `__llvbf_exit`.
 
