@@ -77,6 +77,142 @@ the output with the IR it came from, which is the main debugging aid.
 `llvbf run` is an optimizing interpreter: it executes `[-]`, balanced multiply/move loops and
 scan loops in constant time. The generated code relies on this heavily (see Performance).
 
+## Compiling C to Brainfuck, step by step
+
+Prerequisites: LLVM 23 with clang (see [Building](#building)) and a built `llvbf`
+(`cargo build --release` puts it at `target/release/llvbf`).
+
+1. Write a C program against the subset of libc that `runtime/include` provides
+   (`stdio.h`, `stdlib.h`, `string.h`, `ctype.h`, `assert.h`, `inttypes.h`, plus clang's
+   freestanding headers such as `stdint.h` and `stdarg.h`). No floating point, no files,
+   no `errno`-style OS interfaces; `stdin`/`stdout` are the Brainfuck `,` and `.`.
+
+   ```c
+   #include <stdio.h>
+   int main(void) {
+       int c, n = 0;
+       while ((c = getchar()) != EOF) n += (c == '\n');
+       printf("%d lines\n", n);
+       return 0;
+   }
+   ```
+
+2. Compile. `llvbf cc` accepts several `.c` files and already-compiled `.ll`/`.bc` files:
+
+   ```
+   llvbf cc count.c -o count.bf
+   ```
+
+   Useful options: `--target msp430` for the 16-bit mode (smaller, faster output, 16-bit
+   `int`), `-O0`…`-O3` (default `-Os`), `--mem-size N` (addressable memory in bytes, default
+   16384, maximum 65536), `--comments` (annotate the output with the IR it came from),
+   `--keep-ir out.ll` (save the optimized IR that was lowered), `-I`/`-D` (passed to clang).
+
+3. Run it, with `llvbf run` or any 8-bit Brainfuck interpreter:
+
+   ```
+   printf 'one\ntwo\n' | llvbf run count.bf
+   2 lines
+   ```
+
+   Other interpreters: the program needs 8-bit wrapping cells and a tape of roughly
+   1.2 × `--mem-size` cells plus about a thousand cells per level of call depth (the hello
+   example uses 23 000 cells with the default memory; `llvbf run --stats` prints the exact
+   number), so the classic 30 000-cell tape is enough for small programs with the default
+   settings but not for `--mem-size 65536`. Ideally the interpreter optimizes balanced loops
+   such as `[->>>+<<<]`, which the generated code relies on for speed. End of input must
+   leave the cell unchanged or set it to 0 or 255.
+
+What can go wrong: a call to a libc function the runtime does not have fails at link time
+("call to undefined function @foo"); floating point, vectors or other unsupported IR fail
+in the loader with the offending LLVM instruction printed; programs that need more than
+64 KiB of memory or recurse thousands of levels deep run out of memory or tape.
+
+## Compiling Rust to Brainfuck, step by step
+
+Prerequisites: a stable Rust toolchain with the `riscv32i-unknown-none-elf` target, whose
+LLVM is not newer than llvbf's (`rustc -vV` shows the LLVM version; llvbf uses LLVM 23
+and reads IR from older LLVMs, never from newer ones).
+
+```
+rustup target add riscv32i-unknown-none-elf
+```
+
+1. Create a `no_std` library crate. The complete example is in [`examples/rust`](examples/rust);
+   the essential parts are:
+
+   ```toml
+   # Cargo.toml
+   [lib]
+   crate-type = ["staticlib"]
+
+   [profile.release]
+   panic = "abort"      # no unwinding machinery
+   opt-level = "s"
+   lto = "fat"          # makes the emitted IR self-contained (core gets linked in)
+   codegen-units = 1
+   ```
+
+   ```rust
+   #![no_std]
+   #![no_main]
+
+   extern "C" {
+       fn __llvbf_putc(c: i32);   // write a byte
+       fn __llvbf_getc() -> i32;  // read a byte (0 at end of input)
+       fn __llvbf_exit();         // stop the program
+   }
+
+   #[no_mangle]
+   pub extern "C" fn main() -> i32 {
+       for b in "Hello from Rust\n".bytes() {
+           unsafe { __llvbf_putc(b as i32) }
+       }
+       0
+   }
+
+   #[panic_handler]
+   fn panic(_: &core::panic::PanicInfo) -> ! {
+       unsafe { __llvbf_exit() }
+       loop {}
+   }
+   ```
+
+   Everything in `core` that does not need floats or an allocator is available (iterators,
+   slices, `Option`/`Result`, formatting with `core::fmt` works but is large). `alloc` is
+   possible with a bump allocator on top of the runtime's `malloc`; `std` is not.
+
+2. Emit LLVM IR instead of an object file:
+
+   ```
+   cargo rustc --release --target riscv32i-unknown-none-elf -- --emit=llvm-ir
+   ```
+
+   The module lands in `target/riscv32i-unknown-none-elf/release/deps/<crate>-<hash>.ll`.
+   Because of `lto = "fat"` it contains the parts of `core` the program uses; the only
+   external symbols left are the three hooks and the `llvm.memset`/`memcpy` intrinsics.
+
+3. Lower it with `llvbf cc`, which links the C runtime for those intrinsics (and for
+   `malloc`, `printf`, … if you declare and call them from Rust):
+
+   ```
+   llvbf cc target/riscv32i-unknown-none-elf/release/deps/*.ll -o hello.bf
+   llvbf run hello.bf
+   ```
+
+Pitfalls: a `Hello` through `core::fmt` pulls in a lot of code (expect a few MB of
+Brainfuck); bounds checks and overflow checks stay in and panic through your handler;
+`usize` is 32 bits but only 64 KiB of memory exist; the 16-bit mode needs a nightly with
+`rust-src` (`-Zbuild-std=core,compiler_builtins --target msp430-none-elf`), see
+`examples/rust/README.md`.
+
+### Other frontends
+
+Anything that emits LLVM IR for a 32-bit target without floating point should work the same
+way: Zig (`-target riscv32-freestanding -femit-llvm-ir`), C++ without exceptions and RTTI
+(`clang++ -fno-exceptions -fno-rtti`, through `llvbf cc`), or hand-written `.ll`. The
+contract is the three hooks above plus the C runtime for `memcpy`/`memset`.
+
 ## How it works
 
 ### Pipeline
@@ -197,15 +333,6 @@ and borrow detection in constant time per step. Addition and subtraction are O(2
 multiplication is shift-and-add; division is restoring long division; signed operations map onto
 unsigned ones by flipping sign bits; bitwise operations decompose limbs into bits. Everything is
 unit-tested against native arithmetic (`cargo test`).
-
-## Rust (and other frontends)
-
-Any LLVM frontend works if it can target 32-bit (or 16-bit) pointers and emit a module with no
-floats. For Rust, `examples/rust` is a `no_std` crate built on **stable** for the Tier 2 target
-`riscv32i-unknown-none-elf` with `panic = "abort"` and `lto = "fat"`; the LTO'd `--emit=llvm-ir`
-output is self-contained and `llvbf cc` links the C runtime for `memset`. rustc's LLVM must not be
-newer than llvbf's (`rustc -vV` shows it). `cargo test` runs this example when the target is
-installed and skips it otherwise.
 
 ## Performance
 
