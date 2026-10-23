@@ -214,15 +214,25 @@ target and the 16-bit mode:
 
 | program | riscv32 size / ops | msp430 size / ops |
 |---|---|---|
-| fib(0..15), recursive, printf | 10.3 MB / 103 M | 4.6 MB / 66 M |
-| bubble sort | 10.3 MB / 9.5 M | 4.6 MB / 7.3 M |
-| strings | 11.4 MB / 17.5 M | 5.0 MB / 14.8 M |
-| sieve to 200 | 10.3 MB / 56 M | 4.6 MB / 43 M |
+| fib(0..15), recursive, printf | 12.4 MB / 51 M | 6.1 MB / 47 M |
+| bubble sort | 12.4 MB / 7 M | 6.1 MB / 6 M |
+| strings | 13.7 MB / 15 M | 6.7 MB / 14 M |
+| sieve to 200 | 12.5 MB / 41 M | 6.1 MB / 36 M |
 
 Almost all of the size is head movement (`>>>…`) between frame slots and scratch, because every
-SSA value has its own slot and frames are several hundred cells wide. Almost all of the time is
-spent in the carry loops of multi-limb arithmetic and in the dispatch chain; the 32-bit target
+SSA value has its own slot and frames are several hundred cells wide. Time goes to the carry
+loops of multi-limb arithmetic, the memory routines and the dispatch chain; the 32-bit target
 doubles the limb count but only costs 1.2–1.6x in executed operations.
+
+`llvbf run --profile` on a program compiled with `--comments` attributes executed operations to
+the IR instructions and routines they came from, which is how to find out where a program's time
+goes. The arithmetic routines are designed around one observation: in Brainfuck, a loop costs one
+pass per unit of the cell it counts down, so every routine should count down the smallest value it
+can. Constants are added or subtracted in whichever form has the smaller limb sum (`x + 0xFFFFFFFF`
+runs as `x - 1`), multiplication extracts the multiplier's bits once and shifts the multiplicand
+only seven times, and division extracts the dividend's bits once, shifts only the remainder and
+skips leading zeros, so the cost of `/` and `%` tracks the size of the values rather than the width
+of the type.
 
 The code assumes an interpreter that runs balanced loops such as `[->>>+<<<]` in constant time.
 On a naive interpreter every copy costs time proportional to the value times the distance, and

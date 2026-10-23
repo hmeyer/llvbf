@@ -181,13 +181,42 @@ pub fn sub_work(e: &mut Emitter, dst: Work, src: Work) {
     }
 }
 
-/// dst += constant.
+/// dst += constant (mod 2^(8n)).
+///
+/// The add/sub loops cost one carry check per unit of each source limb, so a
+/// constant is applied in whichever of its two representations has the smaller
+/// limb sum: `x + 0xFFFFFFFF` becomes `x - 1`.
 pub fn add_const(e: &mut Emitter, sc: &mut Scratch, dst: Work, value: u64) {
+    let bits = 8 * dst.n as u32;
+    let v = mask(value, bits);
+    if v == 0 {
+        return;
+    }
+    let neg = mask(v.wrapping_neg(), bits);
     let m = sc.mark();
     let t = Work::alloc(sc, dst.n);
-    load_const(e, t, value);
-    add_work(e, dst, t);
+    if limb_sum(neg, dst.n) < limb_sum(v, dst.n) {
+        load_const(e, t, neg);
+        sub_work(e, dst, t);
+    } else {
+        load_const(e, t, v);
+        add_work(e, dst, t);
+    }
     sc.release(m);
+}
+
+fn mask(v: u64, bits: u32) -> u64 {
+    if bits >= 64 {
+        v
+    } else {
+        v & ((1u64 << bits) - 1)
+    }
+}
+
+/// Sum of the limb values of a constant: the number of carry-check iterations an
+/// add or sub loop would run for it.
+fn limb_sum(v: u64, n: usize) -> u64 {
+    (0..n.min(8)).map(|i| (v >> (8 * i)) & 0xff).sum()
 }
 
 /// Two's complement negation in place.
@@ -513,27 +542,55 @@ pub fn shift_var(e: &mut Emitter, sc: &mut Scratch, w: Work, cnt: Work, kind: u8
 // ---------------------------------------------------------------------------
 
 /// res = a * b (mod 2^(8n)). `a` and `b` are destroyed. `res` must be a zeroed work area.
+///
+/// The bits of `b` are extracted once and the doublings `a << k` (k = 0..7) are
+/// computed once; bit k of limb j of `b` then adds `a << k`, shifted up by j limbs,
+/// into the result. Shifting by whole limbs is free, so `a` is shifted only 7 times
+/// instead of once per bit.
 pub fn mul_work(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, res: Work) {
     let n = res.n;
     let m = sc.mark();
-    let nz = sc.alloc(1);
-    let bit = sc.alloc(1);
-    is_nonzero(e, sc, b, nz);
-    e.while_nonzero(nz, |e| {
-        e.clear(nz);
-        shr1(e, sc, b, Some(bit));
-        e.while_nonzero(bit, |e| {
-            e.dec(bit);
-            let m2 = sc.mark();
-            let t = Work::alloc(sc, n);
-            copy_work(e, sc, a, t);
-            add_work(e, res, t);
-            sc.release(m2);
-        });
-        shl1(e, sc, a, None);
-        is_nonzero(e, sc, b, nz);
-    });
-    clear_work(e, a);
+    // Bits of b: bit k of limb j at bits + 8j + k.
+    let bits = sc.alloc(8 * n);
+    for j in 0..n {
+        to_bits(e, sc, b.limb(j), bits + 8 * j as Cell);
+    }
+    // doublings[k] = a << k (mod 2^(8n)); the last one takes `a` itself.
+    let mut doublings: Vec<Work> = Vec::with_capacity(8);
+    for k in 0..8 {
+        if k == 7 {
+            doublings.push(a);
+        } else {
+            let d = Work::alloc(sc, n);
+            copy_work(e, sc, a, d);
+            doublings.push(d);
+        }
+        if k < 7 {
+            shl1(e, sc, a, None);
+        }
+    }
+    // a now holds a << 7, i.e. doublings[7].
+    for j in 0..n {
+        for (k, doubling) in doublings.iter().enumerate() {
+            let bit = bits + (8 * j + k) as Cell;
+            e.while_nonzero(bit, |e| {
+                e.dec(bit);
+                let m2 = sc.mark();
+                let t = Work::alloc(sc, n - j);
+                copy_work(e, sc, doubling.truncated(n - j), t);
+                // res[j..] += t
+                let upper = Work {
+                    base: res.limb(j),
+                    n: n - j,
+                };
+                add_work(e, upper, t);
+                sc.release(m2);
+            });
+        }
+    }
+    for d in doublings {
+        clear_work(e, d);
+    }
     sc.release(m);
 }
 
@@ -570,49 +627,64 @@ pub fn mul_const(e: &mut Emitter, sc: &mut Scratch, a: Work, c: u64, res: Work) 
 }
 
 /// Unsigned division: q = a / b, r = a % b. `a` and `b` destroyed; `q`, `r` zeroed work areas of n limbs.
+///
+/// Binary long division, MSB first, with the dividend's bits extracted once (so the
+/// dividend is never shifted), quotient bits set in place (so the quotient is never
+/// shifted) and only the remainder shifted, which stays below the divisor. Each step
+/// subtracts the divisor from the remainder (which has an extra limb) and adds it
+/// back when the result went negative. Steps while the remainder is still zero and
+/// the incoming bit is zero are skipped at runtime, so small dividends are cheap.
 pub fn udivrem(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, q: Work, r: Work) {
     let n = a.n;
     let m = sc.mark();
-    let rr = Work::alloc(sc, n + 1); // remainder with an extra limb for comparison
-    let topbit = sc.alloc(1);
-    let lt = Work::alloc(sc, 1);
-    let cnt = sc.alloc(1);
-    e.set_using(cnt, (8 * n) as u8, cnt + 1);
-    e.while_nonzero(cnt, |e| {
-        e.dec(cnt);
-        shl1(e, sc, a, Some(topbit));
-        shl1(e, sc, rr.truncated(n), None);
-        e.move_cell(topbit, rr.limb(0));
-        shl1(e, sc, q, None);
-        // lt = rr < b ?
-        {
-            let m2 = sc.mark();
-            let ta = Work::alloc(sc, n + 1);
-            let tb = Work::alloc(sc, n);
-            copy_work(e, sc, rr.truncated(n), ta.truncated(n));
-            copy_work(e, sc, b, tb);
-            ult_destructive(e, ta, tb, lt.limb(0));
-            sc.release(m2);
-        }
-        // if !(rr < b): rr -= b; q |= 1
+    let bits = sc.alloc(8 * n);
+    for j in 0..n {
+        to_bits(e, sc, a.limb(j), bits + 8 * j as Cell);
+    }
+    let rr = Work::alloc(sc, n + 1); // remainder with an extra limb that becomes 255 on a negative result
+    let started = sc.alloc(1); // becomes 1 at the first nonzero bit
+    for i in (0..8 * n).rev() {
+        let bit = bits + i as Cell;
+        // started |= bit
         let m2 = sc.mark();
-        let f = sc.alloc(1);
-        e.if_zero(lt.limb(0), |e| {
-            e.inc(f);
+        let t = sc.alloc(1);
+        e.copy_cell(bit, t, sc.alloc(1));
+        e.while_nonzero(t, |e| {
+            e.dec(t);
+            e.clear(started);
+            e.inc(started);
         });
-        e.clear(lt.limb(0));
+        // if started: rr = 2*rr + bit; rr -= b; if negative add b back else set bit i of q
+        let f = sc.alloc(1);
+        e.copy_cell(started, f, sc.alloc(1));
         e.while_nonzero(f, |e| {
             e.dec(f);
+            shl1(e, sc, rr.truncated(n), None);
+            e.move_cell(bit, rr.limb(0));
             let m3 = sc.mark();
             let tb = Work::alloc(sc, n);
             copy_work(e, sc, b, tb);
-            sub_work(e, rr.truncated(n), tb);
-            e.inc(q.limb(0));
+            sub_work(e, rr, tb);
+            let positive = sc.alloc(1);
+            e.inc(positive);
+            e.if_nonzero(rr.limb(n), sc.alloc(1), |e| {
+                e.dec(positive);
+                let m4 = sc.mark();
+                let tb = Work::alloc(sc, n);
+                copy_work(e, sc, b, tb);
+                add_work(e, rr, tb); // restores rr and clears the top limb
+                sc.release(m4);
+            });
+            e.while_nonzero(positive, |e| {
+                e.dec(positive);
+                e.add(q.limb(i / 8), 1 << (i % 8));
+            });
             sc.release(m3);
         });
+        e.clear(bit); // the bit was consumed when started, and is zero otherwise
         sc.release(m2);
-    });
-    clear_work(e, a);
+    }
+    e.clear(started);
     clear_work(e, b);
     move_work(e, rr.truncated(n), r);
     sc.release(m);

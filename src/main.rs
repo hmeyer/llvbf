@@ -8,7 +8,7 @@ fn usage() -> ! {
   llvbf cc <sources.c...> [-o out.bf] [--run] [--target TRIPLE] [-O0|-O1|-O2|-O3|-Os|-Oz]
            [--mem-size N] [--comments] [--entry NAME] [--runtime DIR] [--no-runtime]
            [--keep-ir out.ll] [--llvm-bin DIR] [-I dir] [-D macro] [-Xclang ARG]
-  llvbf run <program.bf> [--max-steps N] [--stats]"
+  llvbf run <program.bf> [--max-steps N] [--stats] [--profile]"
     );
     std::process::exit(2);
 }
@@ -148,6 +148,7 @@ fn real_main() -> Result<()> {
                 .with_context(|| format!("reading {}", args[2]))?;
             let mut max_steps = None;
             let mut stats = false;
+            let mut profile = false;
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
@@ -156,11 +157,33 @@ fn real_main() -> Result<()> {
                         i += 1;
                     }
                     "--stats" => stats = true,
+                    "--profile" => profile = true,
                     _ => usage(),
                 }
                 i += 1;
             }
             let prog = llvbf::bfi::Program::parse(&src)?;
+            if profile {
+                // Attribute executed ops to the `# ...` comments of a program compiled with --comments.
+                let input = {
+                    use std::io::Read;
+                    let mut v = Vec::new();
+                    std::io::stdin().read_to_end(&mut v)?;
+                    v
+                };
+                let counts = prog.profile(&input, max_steps)?;
+                let total: u64 = counts.iter().map(|c| c.1).sum();
+                eprintln!("[llvbf] {} ops; top regions:", total);
+                for (name, c) in counts.iter().take(30) {
+                    eprintln!(
+                        "{:>12} {:5.1}%  {}",
+                        c,
+                        100.0 * *c as f64 / total as f64,
+                        name
+                    );
+                }
+                return Ok(());
+            }
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let mut inp = stdin.lock();
