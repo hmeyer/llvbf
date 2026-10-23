@@ -906,13 +906,16 @@ pub fn bitwise(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, kind: u8) {
     let m = sc.mark();
     let ba = sc.alloc(8);
     let bb = sc.alloc(8);
+    let acc = sc.alloc(1);
     let t = sc.alloc(1);
     for i in 0..a.n {
         to_bits(e, sc, a.limb(i), ba);
         to_bits(e, sc, b.limb(i), bb);
-        let res = a.limb(i);
-        for k in 0..8 {
-            let v = 1i32 << k;
+        // Recombine from the top bit down: acc = 2*acc + (x op y), next to the bits.
+        for k in (0..8).rev() {
+            if k < 7 {
+                double_cell(e, acc, t);
+            }
             let (x, y) = (ba + k, bb + k);
             match kind {
                 0 => {
@@ -920,7 +923,7 @@ pub fn bitwise(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, kind: u8) {
                         e.dec(x);
                         e.while_nonzero(y, |e| {
                             e.dec(y);
-                            e.add(res, v);
+                            e.inc(acc);
                         });
                     });
                     e.clear(y);
@@ -929,11 +932,11 @@ pub fn bitwise(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, kind: u8) {
                     e.while_nonzero(x, |e| {
                         e.dec(x);
                         e.clear(y);
-                        e.add(res, v);
+                        e.inc(acc);
                     });
                     e.while_nonzero(y, |e| {
                         e.dec(y);
-                        e.add(res, v);
+                        e.inc(acc);
                     });
                 }
                 _ => {
@@ -942,23 +945,36 @@ pub fn bitwise(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, kind: u8) {
                     // t in {0,1,2}; xor bit is (t == 1)
                     e.while_nonzero(t, |e| {
                         e.dec(t);
-                        e.add(res, v);
+                        e.inc(acc);
                         e.while_nonzero(t, |e| {
                             e.dec(t);
-                            e.add(res, -v);
+                            e.dec(acc);
                         });
                     });
                 }
             }
         }
+        e.move_cell(acc, a.limb(i));
     }
     sc.release(m);
+}
+
+/// x = 2*x using the zero cell `t` (left zero).
+fn double_cell(e: &mut Emitter, x: Cell, t: Cell) {
+    e.while_nonzero(x, |e| {
+        e.dec(x);
+        e.add(t, 2);
+    });
+    e.move_cell(t, x);
 }
 
 /// Bitwise op with a constant mask, per limb. Limbs where the mask is 0x00 or 0xFF are
 /// handled without bit decomposition.
 pub fn bitwise_const(e: &mut Emitter, sc: &mut Scratch, a: Work, c: u64, kind: u8) {
     let m = sc.mark();
+    let ba = sc.alloc(8);
+    let acc = sc.alloc(1);
+    let t = sc.alloc(1);
     for i in 0..a.n {
         let limb = ((c >> (8 * i)) & 0xff) as u8;
         let x = a.limb(i);
@@ -970,40 +986,33 @@ pub fn bitwise_const(e: &mut Emitter, sc: &mut Scratch, a: Work, c: u64, kind: u
             (2, 0x00) => {}
             (2, 0xff) => {
                 // 255 - x
-                let t = sc.alloc(1);
                 e.add(t, 255);
                 e.move_cell_neg(x, t);
                 e.move_cell(t, x);
             }
             _ => {
-                let ba = sc.alloc(8);
                 to_bits(e, sc, x, ba);
-                for k in 0..8 {
-                    let v = 1i32 << k;
+                for k in (0..8).rev() {
+                    if k < 7 {
+                        double_cell(e, acc, t);
+                    }
                     let mb = (limb >> k) & 1 == 1;
                     let bit = ba + k;
                     match (kind, mb) {
-                        (0, true) | (1, false) | (2, false) => {
-                            e.while_nonzero(bit, |e| {
-                                e.dec(bit);
-                                e.add(x, v);
-                            });
-                        }
+                        (0, true) | (1, false) | (2, false) => e.move_cell(bit, acc),
                         (0, false) => e.clear(bit),
                         (1, true) => {
                             e.clear(bit);
-                            e.add(x, v);
+                            e.inc(acc);
                         }
                         (2, true) => {
-                            e.add(x, v);
-                            e.while_nonzero(bit, |e| {
-                                e.dec(bit);
-                                e.add(x, -v);
-                            });
+                            e.inc(acc);
+                            e.move_cell_neg(bit, acc);
                         }
                         _ => unreachable!(),
                     }
                 }
+                e.move_cell(acc, x);
             }
         }
     }

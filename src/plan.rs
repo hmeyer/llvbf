@@ -806,14 +806,38 @@ fn allocate_cross_block(
             }
         }
     }
+    // Placement: the most used groups get the lowest offsets (closest to the scratch
+    // area), each at the lowest offset not taken by an already placed group whose
+    // interval overlaps. Intervals that merely touch count as overlapping, as in the
+    // pool allocator.
     let mut live_groups: Vec<(usize, usize, Vec<Value>)> =
         groups.into_iter().filter(|g| !g.2.is_empty()).collect();
-    live_groups.sort_unstable();
-    let mut alloc = IntervalAllocator::default();
+    let weight = |members: &[Value]| -> usize {
+        members
+            .iter()
+            .map(|v| 1 + uses.get(v).map_or(0, |u| u.len()))
+            .sum()
+    };
+    live_groups.sort_by_key(|g| (std::cmp::Reverse(weight(&g.2)), g.0, g.1));
+    let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (off, len, start, end)
+    let mut top = 0;
     for (start, end, members) in live_groups {
-        alloc.release_dead(start);
         let size = types.size(f.value_ty(members[0]));
-        let off = alloc.alloc(size + 1, end);
+        let len = size + 1;
+        let overlapping: Vec<(usize, usize)> = placed
+            .iter()
+            .filter(|p| !(end < p.2 || p.3 < start))
+            .map(|p| (p.0, p.1))
+            .collect();
+        let mut candidates: Vec<usize> = overlapping.iter().map(|(o, l)| o + l).collect();
+        candidates.push(0);
+        candidates.sort_unstable();
+        let off = candidates
+            .into_iter()
+            .find(|&c| overlapping.iter().all(|(o, l)| c + len <= *o || o + l <= c))
+            .unwrap();
+        placed.push((off, len, start, end));
+        top = top.max(off + len);
         for v in members {
             slots.insert(
                 v,
@@ -825,7 +849,7 @@ fn allocate_cross_block(
             );
         }
     }
-    (alloc.top, edge_moves)
+    (top, edge_moves)
 }
 
 /// The SSA values an instruction reads.
