@@ -95,23 +95,35 @@ impl<'a> Gen<'a> {
         }
         let mut ws = Scratch::new(ws_base);
         std::mem::swap(&mut self.sc, &mut ws);
+        // Operands and results are laid out so that the cells the routine's inner
+        // loops walk between (divisor and remainder, multiplicand and product) are
+        // adjacent.
         let wa = Work::alloc(&mut self.sc, n);
-        let wb = Work::alloc(&mut self.sc, n);
+        let (wb, qr) = match kind {
+            ArithKind::Mul => {
+                let res = Work::alloc(&mut self.sc, n);
+                (Work::alloc(&mut self.sc, n), (res, res))
+            }
+            ArithKind::UDiv | ArithKind::SDiv => {
+                let q = Work::alloc(&mut self.sc, n);
+                let r = Work::alloc(&mut self.sc, n);
+                (Work::alloc(&mut self.sc, n), (q, r))
+            }
+        };
         for i in 0..n {
             self.e.move_cell(arg + i as Cell, wa.limb(i));
             self.e.move_cell(arg + (n + i) as Cell, wb.limb(i));
         }
         match kind {
             ArithKind::Mul => {
-                let res = Work::alloc(&mut self.sc, n);
+                let res = qr.0;
                 mul_work(&mut self.e, &mut self.sc, wa, wb, res);
                 for i in 0..n {
                     self.e.move_cell(res.limb(i), arg + i as Cell);
                 }
             }
             ArithKind::UDiv | ArithKind::SDiv => {
-                let q = Work::alloc(&mut self.sc, n);
-                let r = Work::alloc(&mut self.sc, n);
+                let (q, r) = qr;
                 if kind == ArithKind::UDiv {
                     udivrem(&mut self.e, &mut self.sc, wa, wb, q, r);
                 } else {

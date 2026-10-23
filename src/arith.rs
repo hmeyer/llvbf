@@ -476,6 +476,86 @@ pub fn shl1(e: &mut Emitter, sc: &mut Scratch, w: Work, out: Option<Cell>) {
     sc.release(m);
 }
 
+/// `q = x / 2^k`, `r = x % 2^k` for a limb `x` (destroyed) and `1 <= k <= 7`; `q`, `r` zero.
+///
+/// A down-counter starting at 2^k is decremented per unit of `x`; each time it
+/// reaches zero it is reloaded and the quotient incremented, so the whole shift by
+/// `k` bits costs one pass over the limb instead of `k`.
+pub fn divmod_pow2(e: &mut Emitter, sc: &mut Scratch, x: Cell, k: u32, q: Cell, r: Cell) {
+    debug_assert!((1..=7).contains(&k));
+    let m = sc.mark();
+    let d = Work::alloc(sc, 1).limb(0); // spaced: `if_zero` needs two zero cells after it
+    let step = 1i32 << k;
+    e.add(d, step);
+    e.while_nonzero(x, |e| {
+        e.dec(x);
+        e.dec(d);
+        e.if_zero(d, |e| {
+            e.add(d, step);
+            e.inc(q);
+        });
+    });
+    // r = 2^k - d
+    e.add(r, step);
+    e.while_nonzero(d, |e| {
+        e.dec(d);
+        e.dec(r);
+    });
+    sc.release(m);
+}
+
+/// Logical shift right by `k` bits (`1 <= k <= 7`) in one pass per limb.
+pub fn shr_bits(e: &mut Emitter, sc: &mut Scratch, w: Work, k: u32) {
+    if k == 1 {
+        return shr1(e, sc, w, None);
+    }
+    let m = sc.mark();
+    let carry = sc.alloc(1); // low k bits of the limb above
+    for i in (0..w.n).rev() {
+        let x = w.limb(i);
+        let q = sc.alloc(1);
+        let r = sc.alloc(1);
+        divmod_pow2(e, sc, x, k, q, r);
+        e.move_cell(q, x);
+        e.while_nonzero(carry, |e| {
+            e.dec(carry);
+            e.add(x, 1 << (8 - k));
+        });
+        if i > 0 {
+            e.move_cell(r, carry);
+        } else {
+            e.clear(r);
+        }
+    }
+    sc.release(m);
+}
+
+/// Shift left by `k` bits (`1 <= k <= 7`) in one pass per limb.
+pub fn shl_bits(e: &mut Emitter, sc: &mut Scratch, w: Work, k: u32) {
+    if k == 1 {
+        return shl1(e, sc, w, None);
+    }
+    let m = sc.mark();
+    let carry = sc.alloc(1); // high k bits of the limb below
+    for i in 0..w.n {
+        let x = w.limb(i);
+        let q = sc.alloc(1);
+        let r = sc.alloc(1);
+        divmod_pow2(e, sc, x, 8 - k, q, r);
+        e.while_nonzero(r, |e| {
+            e.dec(r);
+            e.add(x, 1 << k);
+        });
+        e.move_cell(carry, x);
+        if i + 1 < w.n {
+            e.move_cell(q, carry);
+        } else {
+            e.clear(q);
+        }
+    }
+    sc.release(m);
+}
+
 /// Shift left by a constant.
 pub fn shl_const(e: &mut Emitter, sc: &mut Scratch, w: Work, k: u32) {
     let n = w.n;
@@ -494,8 +574,8 @@ pub fn shl_const(e: &mut Emitter, sc: &mut Scratch, w: Work, k: u32) {
             }
         }
     }
-    for _ in 0..(k % 8) {
-        shl1(e, sc, w, None);
+    if !k.is_multiple_of(8) {
+        shl_bits(e, sc, w, k % 8);
     }
 }
 
@@ -515,8 +595,8 @@ pub fn lshr_const(e: &mut Emitter, sc: &mut Scratch, w: Work, k: u32) {
             }
         }
     }
-    for _ in 0..(k % 8) {
-        shr1(e, sc, w, None);
+    if !k.is_multiple_of(8) {
+        shr_bits(e, sc, w, k % 8);
     }
 }
 
@@ -639,35 +719,57 @@ pub fn mul_work(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, res: Work) 
 }
 
 /// res = a * constant. `a` is destroyed, `res` must be zero.
+///
+/// Horner's scheme over the non-adjacent form of the constant (digits -1, 0, 1, no
+/// two adjacent nonzero): res = 2*res + digit*a, runs of zero digits taken as one
+/// multi-bit shift. The constant is read as signed, so `x * -10` costs two
+/// subtractions rather than thirty additions.
 pub fn mul_const(e: &mut Emitter, sc: &mut Scratch, a: Work, c: u64, res: Work) {
     let n = res.n;
     let bits = 8 * n as u32;
-    let c = if bits >= 64 {
-        c
-    } else {
-        c & ((1u64 << bits) - 1)
-    };
+    let c = mask(c, bits);
     if c == 0 {
         clear_work(e, a);
         return;
     }
-    let top = 63 - c.leading_zeros();
-    for k in 0..=top {
-        if (c >> k) & 1 == 1 {
-            let m = sc.mark();
-            let t = Work::alloc(sc, n);
-            if k == top {
-                move_work(e, a, t);
-            } else {
-                copy_work(e, sc, a, t);
-            }
-            add_work(e, res, t);
-            sc.release(m);
+    let mut v: i128 = c as i128;
+    if bits < 64 && c >> (bits - 1) == 1 {
+        v -= 1i128 << bits;
+    } else if bits == 64 && (c as i64) < 0 {
+        v = c as i64 as i128;
+    }
+    // Non-adjacent form, least significant digit first.
+    let mut digits: Vec<i8> = Vec::new();
+    while v != 0 {
+        if v & 1 == 1 {
+            let d = 2 - (v & 3) as i8; // 1 or -1
+            digits.push(d);
+            v -= d as i128;
+        } else {
+            digits.push(0);
         }
-        if k < top {
-            shl1(e, sc, a, None);
+        v /= 2;
+    }
+    let mut run = 0;
+    for (k, &d) in digits.iter().enumerate().rev() {
+        if d == 0 {
+            run += 1;
+            continue;
+        }
+        if k + 1 < digits.len() {
+            shl_const(e, sc, res, run + 1);
+        }
+        run = 0;
+        if d > 0 {
+            add_work_keep(e, res, a);
+        } else {
+            sub_work_keep(e, res, a);
         }
     }
+    if run > 0 {
+        shl_const(e, sc, res, run);
+    }
+    clear_work(e, a);
 }
 
 /// Unsigned division: q = a / b, r = a % b. `a` and `b` destroyed; `q`, `r` zeroed work areas of n limbs.
