@@ -188,9 +188,9 @@ impl Program {
                     output.flush()?;
                     outbuf.clear();
                     let mut b = [0u8; 1];
-                    match input.read(&mut b) {
-                        Ok(1) => tape[p] = b[0],
-                        _ => {} // EOF: leave unchanged
+                    // At end of input the cell is left unchanged.
+                    if let Ok(1) = input.read(&mut b) {
+                        tape[p] = b[0];
                     }
                 }
                 Op::LoopStart(end) => {
@@ -240,6 +240,10 @@ impl Program {
     /// Number of compiled operations.
     pub fn len(&self) -> usize {
         self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 }
 

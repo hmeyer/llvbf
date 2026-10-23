@@ -46,6 +46,10 @@ impl Emitter {
         self.code.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty()
+    }
+
     pub fn pos(&self) -> Cell {
         self.pos
     }
