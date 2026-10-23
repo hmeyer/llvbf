@@ -70,6 +70,7 @@ impl<'a> Gen<'a> {
         let (dcell, size) = self.slot(dest)?;
         match &val.kind {
             OperandKind::Value(v) if *v == dest => Ok(()), // loop-carried value unchanged
+            OperandKind::Value(v) if self.slot(*v)?.0 == dcell => Ok(()), // coalesced
             OperandKind::Value(v) => {
                 let (scell, ssize) = self.slot(*v)?;
                 let n = size.min(ssize);

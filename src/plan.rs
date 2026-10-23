@@ -391,9 +391,24 @@ fn plan_function(
             *term_uses.entry(v).or_default() += 1;
         }
     }
+    // Instruction results fed into a phi are kept out of the pool so that they can
+    // share the phi's slot (see `allocate_cross_block`), which makes the phi copy a
+    // no-op.
+    let mut phi_feeders: HashSet<Value> = HashSet::new();
+    for bb in &f.blocks {
+        for phi in &bb.phis {
+            for (val, _) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    if matches!(def_block.get(&v), Some(&bi) if bi != usize::MAX) {
+                        phi_feeders.insert(v);
+                    }
+                }
+            }
+        }
+    }
     let is_local = |v: Value| -> bool {
         match def_block.get(&v) {
-            Some(&bi) if bi != usize::MAX => uses
+            Some(&bi) if bi != usize::MAX && !phi_feeders.contains(&v) => uses
                 .get(&v)
                 .map(|u| u.iter().all(|(b, _)| *b == bi))
                 .unwrap_or(true),
@@ -593,8 +608,8 @@ impl IntervalAllocator {
     }
 }
 
-/// Allocate dedicated slots for phis and cross-block values; returns the area size
-/// and the values each edge may move into the successor's phis.
+/// Allocate dedicated slots for phis and cross-block values (phi inputs included);
+/// returns the area size and the values each edge may move into the successor's phis.
 ///
 /// Blocks are laid out in order to give every instruction a position (a block of
 /// `k` instructions occupies `k + 1` positions, the last one for its terminator).
@@ -663,22 +678,21 @@ fn allocate_cross_block(
                 }
             }
         }
-        let reads = bb
-            .instrs
-            .iter()
-            .flat_map(|inst| op_values(&inst.op).into_iter().chain(inst.dest))
-            .chain(term_values(&bb.term));
-        // `dest` is chained after the operands so a value read by its own definition's
-        // operands is still seen as upward-exposed; SSA forbids that anyway.
-        for v in reads {
-            if def_pos.contains_key(&v) && !defined[b].contains(&v) {
-                upward[b].insert(v);
+        let read = |v: Value, defined: &HashSet<Value>, upward: &mut HashSet<Value>| {
+            if def_pos.contains_key(&v) && !defined.contains(&v) {
+                upward.insert(v);
             }
-        }
+        };
         for inst in &bb.instrs {
+            for v in op_values(&inst.op) {
+                read(v, &defined[b], &mut upward[b]);
+            }
             if let Some(d) = inst.dest {
                 defined[b].insert(d);
             }
+        }
+        for v in term_values(&bb.term) {
+            read(v, &defined[b], &mut upward[b]);
         }
     }
     let mut live_in: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
@@ -751,20 +765,65 @@ fn allocate_cross_block(
             }
         }
     }
-    intervals.sort_unstable();
+    // Coalescing: a phi and an incoming value whose intervals do not overlap (they
+    // may touch: the copy at the touching point then reads and writes the same slot)
+    // share one slot, which turns the phi copy into a no-op. Groups are built
+    // greedily; a group's interval is the hull of its members.
+    let mut group_of: HashMap<Value, usize> = HashMap::new();
+    let mut groups: Vec<(usize, usize, Vec<Value>)> = Vec::new();
+    let interval_of = |v: Value| -> (usize, usize) {
+        let e = intervals.iter().find(|(_, _, x)| *x == v).unwrap();
+        (e.0, e.1)
+    };
+    for &v in def_pos.keys() {
+        let (s, e) = interval_of(v);
+        group_of.insert(v, groups.len());
+        groups.push((s, e, vec![v]));
+    }
+    for bb in &f.blocks {
+        for phi in &bb.phis {
+            for (val, _) in &phi.incoming {
+                let Some(v) = val.as_value() else { continue };
+                if !def_pos.contains_key(&v) || types.size(f.value_ty(v)) != types.size(phi.ty) {
+                    continue;
+                }
+                let (gp, gv) = (group_of[&phi.dest], group_of[&v]);
+                if gp == gv {
+                    continue;
+                }
+                let (ps, pe, _) = groups[gp].clone();
+                let (vs, ve, _) = groups[gv].clone();
+                if ve <= ps || pe <= vs {
+                    // Merge gv into gp.
+                    let (_, _, members) = std::mem::take(&mut groups[gv]);
+                    for m in &members {
+                        group_of.insert(*m, gp);
+                    }
+                    groups[gp].0 = ps.min(vs);
+                    groups[gp].1 = pe.max(ve);
+                    groups[gp].2.extend(members);
+                }
+            }
+        }
+    }
+    let mut live_groups: Vec<(usize, usize, Vec<Value>)> =
+        groups.into_iter().filter(|g| !g.2.is_empty()).collect();
+    live_groups.sort_unstable();
     let mut alloc = IntervalAllocator::default();
-    for (start, end, v) in intervals {
+    for (start, end, members) in live_groups {
         alloc.release_dead(start);
-        let size = types.size(f.value_ty(v));
+        let size = types.size(f.value_ty(members[0]));
         let off = alloc.alloc(size + 1, end);
-        slots.insert(
-            v,
-            Slot {
-                kind: SlotKind::Local,
-                off,
-                size,
-            },
-        );
+        for v in members {
+            slots.insert(
+                v,
+                Slot {
+                    kind: SlotKind::Local,
+                    off,
+                    size,
+                },
+            );
+        }
     }
     (alloc.top, edge_moves)
 }
