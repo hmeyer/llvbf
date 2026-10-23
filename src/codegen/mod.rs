@@ -23,6 +23,7 @@ use crate::ir::*;
 use crate::plan::*;
 use anyhow::{anyhow, bail, Context as _, Result};
 use instr::Cast;
+use std::collections::HashMap;
 
 pub struct Options {
     /// Size of addressable memory in bytes (multiple of 256, at most 65536).
@@ -64,10 +65,16 @@ pub struct Layout {
     pub t: Cell,
     pub data: Cell,
     pub msp: Cell,
-    pub scratch: Cell,
-    pub scratch_size: usize,
     pub ret: Cell,
     pub params: Cell,
+    /// Pool of block-local slots, placed next to scratch so that most operand
+    /// copies travel a short distance.
+    pub pool: Cell,
+    /// A spare zero cell next to the slots, used as the temporary of slot-to-slot copies.
+    pub copy_tmp: Cell,
+    pub scratch: Cell,
+    pub scratch_size: usize,
+    /// Dedicated slots of cross-block values and phis.
     pub locals: Cell,
     pub frame: Cell,
     pub ctl: Cell,
@@ -95,10 +102,12 @@ impl Layout {
         let data = t + 1;
         let ctl = data + 8;
         let msp = ctl;
-        let scratch = msp + ptr_bytes as Cell;
-        let ret = scratch + scratch_size as Cell;
+        let ret = msp + ptr_bytes as Cell;
         let params = ret + plan.ret_max as Cell;
-        let locals = params + plan.params_max as Cell;
+        let pool = params + plan.params_max as Cell;
+        let copy_tmp = pool + plan.pool_max as Cell;
+        let scratch = copy_tmp + 1;
+        let locals = scratch + scratch_size as Cell;
         let frame = locals + plan.locals_max as Cell;
         Layout {
             active,
@@ -117,10 +126,12 @@ impl Layout {
             t,
             data,
             msp,
-            scratch,
-            scratch_size,
             ret,
             params,
+            pool,
+            copy_tmp,
+            scratch,
+            scratch_size,
             locals,
             frame,
             ctl,
@@ -164,6 +175,11 @@ struct Gen<'a> {
     func_entry: Vec<Option<u16>>,
     /// Index into `plan.funcs` of the function being emitted.
     cur: usize,
+    /// Remaining instruction-operand uses of the pooled values of the block being
+    /// emitted; a value whose count reaches zero is moved rather than copied.
+    uses_left: HashMap<Value, usize>,
+    /// True while emitting a terminator (phi copies, conditions, return values).
+    in_terminator: bool,
 }
 
 /// Compile a module to Brainfuck.
@@ -200,6 +216,8 @@ fn run_gen(
         sc,
         func_entry,
         cur: 0,
+        uses_left: HashMap::new(),
+        in_terminator: false,
     };
     g.emit_program()?;
     let used = g.sc.used();
@@ -247,8 +265,43 @@ impl<'a> Gen<'a> {
     fn slot_cell(&self, s: &Slot) -> Cell {
         match s.kind {
             SlotKind::Param => self.lay.params + s.off as Cell,
+            SlotKind::Pool => self.lay.pool + s.off as Cell,
             SlotKind::Local => self.lay.locals + s.off as Cell,
         }
+    }
+
+    /// Record a use of `v` and decide whether this use may consume (move) the value
+    /// instead of copying it. Only pooled values qualify: all their uses are in one
+    /// block, so the textual order of uses is the execution order. Inside a
+    /// terminator a value may be moved if no instruction uses remain and the
+    /// terminator (including phi copies on every edge) mentions it exactly once.
+    fn consume_use(&mut self, v: Value) -> bool {
+        let fp = self.fp();
+        let Some(&term_uses) = fp.term_uses.get(&v) else {
+            return false;
+        };
+        if self.in_terminator {
+            return self.uses_left.get(&v).copied().unwrap_or(0) == 0 && term_uses == 1;
+        }
+        let left = self.uses_left.entry(v).or_insert(0);
+        *left = left.saturating_sub(1);
+        *left == 0 && term_uses == 0
+    }
+
+    /// Copy or move limbs `off..off+n` of a slot into consecutive scratch cells.
+    fn fetch_slot(&mut self, v: Value, off: usize, w: Work) -> Result<()> {
+        let (cell, size) = self.slot(v)?;
+        if off + w.n > size {
+            bail!("byte range out of slot bounds for {}", v);
+        }
+        if self.consume_use(v) {
+            for i in 0..w.n {
+                self.e.move_cell(cell + (off + i) as Cell, w.limb(i));
+            }
+        } else {
+            load_packed(&mut self.e, &mut self.sc, cell + off as Cell, w);
+        }
+        Ok(())
     }
 
     fn op_bits(&self, op: &Operand) -> Result<u32> {
@@ -263,9 +316,9 @@ impl<'a> Gen<'a> {
     fn load_operand(&mut self, op: &Operand, w: Work) -> Result<()> {
         match &op.kind {
             OperandKind::Value(v) => {
-                let (cell, size) = self.slot(*v)?;
+                let (_, size) = self.slot(*v)?;
                 let n = w.n.min(size);
-                load_packed(&mut self.e, &mut self.sc, cell, w.truncated(n));
+                self.fetch_slot(*v, 0, w.truncated(n))?;
             }
             OperandKind::Const(_) => {
                 let v = self.ce().operand_scalar(op)?;
@@ -278,13 +331,7 @@ impl<'a> Gen<'a> {
     /// Bytes `off..off+n` of an operand's in-memory representation into a work area.
     fn load_operand_bytes(&mut self, op: &Operand, off: usize, w: Work) -> Result<()> {
         match &op.kind {
-            OperandKind::Value(v) => {
-                let (cell, size) = self.slot(*v)?;
-                if off + w.n > size {
-                    bail!("byte range out of slot bounds for {}", v);
-                }
-                load_packed(&mut self.e, &mut self.sc, cell + off as Cell, w);
-            }
+            OperandKind::Value(v) => self.fetch_slot(*v, off, w)?,
             OperandKind::Const(c) => {
                 let bytes = self.ce().bytes(c, op.ty)?;
                 for k in 0..w.n {

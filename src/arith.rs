@@ -185,7 +185,8 @@ pub fn sub_work(e: &mut Emitter, dst: Work, src: Work) {
 ///
 /// The add/sub loops cost one carry check per unit of each source limb, so a
 /// constant is applied in whichever of its two representations has the smaller
-/// limb sum: `x + 0xFFFFFFFF` becomes `x - 1`.
+/// limb sum: `x + 0xFFFFFFFF` becomes `x - 1`. Only the nonzero limbs of the
+/// constant get a loop at all.
 pub fn add_const(e: &mut Emitter, sc: &mut Scratch, dst: Work, value: u64) {
     let bits = 8 * dst.n as u32;
     let v = mask(value, bits);
@@ -193,14 +194,27 @@ pub fn add_const(e: &mut Emitter, sc: &mut Scratch, dst: Work, value: u64) {
         return;
     }
     let neg = mask(v.wrapping_neg(), bits);
-    let m = sc.mark();
-    let t = Work::alloc(sc, dst.n);
-    if limb_sum(neg, dst.n) < limb_sum(v, dst.n) {
-        load_const(e, t, neg);
-        sub_work(e, dst, t);
+    let (c, subtract) = if limb_sum(neg, dst.n) < limb_sum(v, dst.n) {
+        (neg, true)
     } else {
-        load_const(e, t, v);
-        add_work(e, dst, t);
+        (v, false)
+    };
+    let m = sc.mark();
+    let t = Work::alloc(sc, 1);
+    for i in 0..dst.n {
+        let limb = ((c >> (8 * i.min(7))) & 0xff) as u8;
+        if limb == 0 {
+            continue;
+        }
+        e.set_using(t.limb(0), limb, t.limb(0) + 1);
+        e.while_nonzero(t.limb(0), |e| {
+            e.dec(t.limb(0));
+            if subtract {
+                dec_with_borrow(e, dst, i);
+            } else {
+                inc_with_carry(e, dst, i);
+            }
+        });
     }
     sc.release(m);
 }

@@ -155,10 +155,18 @@ impl<'a> Gen<'a> {
             self.sc.release(m);
         }
         self.comment("call: set up callee frame");
-        for k in 0..self.ptr_limbs() {
-            self.e.clear(f + lay.msp + k as Cell);
-            self.e
-                .copy_cell(lay.msp + k as Cell, f + lay.msp + k as Cell, lay.tmp);
+        // The memory stack pointer travels with the frame only when the callee (or
+        // something it calls) uses it.
+        let callee_needs_msp = match &target {
+            Target::Plan(idx) => self.plan.needs_msp[self.plan.funcs[*idx].fid],
+            Target::Pointer(_) => true,
+        };
+        if callee_needs_msp {
+            for k in 0..self.ptr_limbs() {
+                self.e.clear(f + lay.msp + k as Cell);
+                self.e
+                    .copy_cell(lay.msp + k as Cell, f + lay.msp + k as Cell, lay.tmp);
+            }
         }
         self.e.set(f + lay.active, 1);
         self.e.clear(f + lay.home);
