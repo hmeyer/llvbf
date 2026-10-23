@@ -216,7 +216,7 @@ fn call_ends_segment(callee: &Callee) -> Result<bool> {
 
 /// Size of a variadic argument slot in the spill area (rounded up to 2 bytes).
 pub fn va_slot_size(size: usize) -> usize {
-    (size + 1) / 2 * 2
+    size.div_ceil(2) * 2
 }
 
 pub fn call_is_variadic(types: &TypeTable, fn_ty: TypeId) -> bool {
@@ -542,11 +542,11 @@ pub fn plan_module(m: &Module, mem_size: usize, entry: &str) -> Result<Plan> {
             bail!("external global @{} has no definition", g.name);
         }
         let align = (g.align as u64).max(types.align(g.ty) as u64).max(1);
-        addr = (addr + align - 1) / align * align;
+        addr = addr.div_ceil(align) * align;
         global_addr[gi] = addr;
         addr += types.size(g.ty) as u64;
     }
-    let heap_start = (addr + 7) / 8 * 8;
+    let heap_start = addr.div_ceil(8) * 8;
     if let Some(gi) = m
         .globals
         .iter()

@@ -1,5 +1,7 @@
 # llvbf — an LLVM backend for Brainfuck
 
+[![CI](https://github.com/hmeyer/llvbf/actions/workflows/ci.yml/badge.svg)](https://github.com/hmeyer/llvbf/actions/workflows/ci.yml)
+
 `llvbf` compiles LLVM IR to Brainfuck. Anything that can be lowered to LLVM IR
 with a 16-bit (or 32-bit) pointer target can therefore be compiled to
 Brainfuck; the bundled driver does this for C with `clang`, and
@@ -218,6 +220,20 @@ spent in the carry loops of multi-limb arithmetic and in the dispatch chain.
 The code assumes an interpreter that runs balanced loops such as `[->>>+<<<]` in constant time.
 On a naive interpreter every copy costs time proportional to the value times the distance, and
 programs become hundreds of times slower; they remain correct.
+
+## Testing
+
+`cargo test` runs four layers, and CI (`.github/workflows/ci.yml`) runs them with `cargo fmt
+--check` and `cargo clippy -D warnings` on every push and pull request:
+
+* unit tests of the interpreter, the emitter idioms and the multi-limb arithmetic (the
+  arithmetic is checked against native integer arithmetic on fixed and random operands);
+* end-to-end tests compiling `examples/*.c` and comparing with `examples/expected/*.txt`;
+* the Rust example (skipped when no suitable nightly is installed);
+* a differential fuzz test (`tests/fuzz_arith.rs`): random C programs over 32-bit arithmetic,
+  loops and arrays are compiled with the host C compiler and with llvbf, and the outputs must
+  match. `LLVBF_FUZZ_COUNT` and `LLVBF_FUZZ_SEED` select the batch; a failure names the seed and
+  keeps the program.
 
 ## Design notes and related work
 

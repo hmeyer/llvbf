@@ -353,7 +353,7 @@ impl<'a> Gen<'a> {
         }
         let size = self.types().size(ty) as u64 * count;
         let align = (align as u64).max(2);
-        let size = (size + align - 1) / align * align;
+        let size = size.div_ceil(align) * align;
         let n = self.ptr_limbs();
         let m = self.sc.mark();
         let w = Work::alloc(&mut self.sc, n);
