@@ -49,25 +49,29 @@ mod bits {
 }
 
 impl<'a> Gen<'a> {
-    pub(super) fn inline_call(&mut self, c: &instruction::Call) -> Result<()> {
-        let name = callee_name(c).ok_or_else(|| anyhow!("indirect call treated as inline"))?;
-        let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    pub(super) fn inline_call(&mut self, inst: &Instr) -> Result<()> {
+        let (callee, args) = match &inst.op {
+            Op::Call { callee, args, .. } => (callee, args),
+            _ => unreachable!(),
+        };
+        let name = intrinsic_name(callee)
+            .ok_or_else(|| anyhow!("call treated as inline"))?
+            .to_string();
+        let args: Vec<&Operand> = args.iter().collect();
+        let dest = inst.dest;
         match name.as_str() {
             "__llvbf_putc" => self.putc(args[0]),
-            "__llvbf_getc" => self.getc(
-                c.dest
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("__llvbf_getc without result"))?,
-            ),
+            "__llvbf_getc" => {
+                self.getc(dest.ok_or_else(|| anyhow!("__llvbf_getc without result"))?)
+            }
             "__llvbf_exit" => {
                 self.e.clear(self.lay.active);
                 Ok(())
             }
             n if n.starts_with("llvm.expect.") => {
-                let ty = self.op_type(args[0]);
-                self.cast(args[0], &ty, c.dest.as_ref().unwrap(), Cast::ZExt)
+                self.cast(args[0], inst.ty, dest.unwrap(), Cast::ZExt)
             }
-            n if n.starts_with("llvm.abs.") => self.abs(args[0], c.dest.as_ref().unwrap()),
+            n if n.starts_with("llvm.abs.") => self.abs(args[0], dest.unwrap()),
             n if n.starts_with("llvm.smax.")
                 || n.starts_with("llvm.smin.")
                 || n.starts_with("llvm.umax.")
@@ -76,26 +80,24 @@ impl<'a> Gen<'a> {
                 self.min_max(
                     args[0],
                     args[1],
-                    c.dest.as_ref().unwrap(),
+                    dest.unwrap(),
                     n.starts_with("llvm.s"),
                     n.contains("max"),
                 )
             }
-            n if n.starts_with("llvm.bswap.") => self.bswap(args[0], c.dest.as_ref().unwrap()),
+            n if n.starts_with("llvm.bswap.") => self.bswap(args[0], dest.unwrap()),
             n if n.starts_with("llvm.fshl.") || n.starts_with("llvm.fshr.") => self.funnel_shift(
                 args[0],
                 args[1],
                 args[2],
-                c.dest.as_ref().unwrap(),
+                dest.unwrap(),
                 n.starts_with("llvm.fshl."),
             ),
-            n if n.starts_with("llvm.ctpop.") => self.ctpop(args[0], c.dest.as_ref().unwrap()),
-            n if n.starts_with("llvm.ctlz.") || n.starts_with("llvm.cttz.") => self.count_zeros(
-                args[0],
-                c.dest.as_ref().unwrap(),
-                n.starts_with("llvm.cttz."),
-            ),
-            n if n.contains(".with.overflow.") => self.with_overflow(c, n),
+            n if n.starts_with("llvm.ctpop.") => self.ctpop(args[0], dest.unwrap()),
+            n if n.starts_with("llvm.ctlz.") || n.starts_with("llvm.cttz.") => {
+                self.count_zeros(args[0], dest.unwrap(), n.starts_with("llvm.cttz."))
+            }
+            n if n.contains(".with.overflow.") => self.with_overflow(inst, &args, n),
             n if is_inline_intrinsic(n) => Ok(()), // lifetime, dbg, assume, va_end, ...
             n => bail!("unsupported call to {}", n),
         }
@@ -111,7 +113,7 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn getc(&mut self, dest: &Name) -> Result<()> {
+    fn getc(&mut self, dest: Value) -> Result<()> {
         let (cell, size) = self.slot(dest)?;
         for k in 0..size {
             self.e.clear(cell + k as Cell);
@@ -121,7 +123,7 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn abs(&mut self, arg: &Operand, dest: &Name) -> Result<()> {
+    fn abs(&mut self, arg: &Operand, dest: Value) -> Result<()> {
         let n = limbs(self.op_bits(arg)?);
         let m = self.sc.mark();
         let w = Work::alloc(&mut self.sc, n);
@@ -141,7 +143,7 @@ impl<'a> Gen<'a> {
         &mut self,
         a: &Operand,
         b: &Operand,
-        dest: &Name,
+        dest: Value,
         signed: bool,
         want_max: bool,
     ) -> Result<()> {
@@ -181,7 +183,7 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn bswap(&mut self, arg: &Operand, dest: &Name) -> Result<()> {
+    fn bswap(&mut self, arg: &Operand, dest: Value) -> Result<()> {
         let n = limbs(self.op_bits(arg)?);
         let m = self.sc.mark();
         let w = Work::alloc(&mut self.sc, n);
@@ -201,7 +203,7 @@ impl<'a> Gen<'a> {
         a: &Operand,
         b: &Operand,
         k: &Operand,
-        dest: &Name,
+        dest: Value,
         left: bool,
     ) -> Result<()> {
         let bits = self.op_bits(a)?;
@@ -264,7 +266,7 @@ impl<'a> Gen<'a> {
         Ok(bits)
     }
 
-    fn ctpop(&mut self, arg: &Operand, dest: &Name) -> Result<()> {
+    fn ctpop(&mut self, arg: &Operand, dest: Value) -> Result<()> {
         let n = limbs(self.op_bits(arg)?);
         let m = self.sc.mark();
         let bits = self.operand_bits(arg, n)?;
@@ -282,7 +284,7 @@ impl<'a> Gen<'a> {
     }
 
     /// Count leading (ctlz) or trailing (cttz) zero bits.
-    fn count_zeros(&mut self, arg: &Operand, dest: &Name, trailing: bool) -> Result<()> {
+    fn count_zeros(&mut self, arg: &Operand, dest: Value, trailing: bool) -> Result<()> {
         let n = limbs(self.op_bits(arg)?);
         let m = self.sc.mark();
         let bits = self.operand_bits(arg, n)?;
@@ -319,12 +321,11 @@ impl<'a> Gen<'a> {
 
     /// `llvm.{u,s}{add,sub}.with.overflow` and `llvm.umul.with.overflow`: the result is
     /// the aggregate `{iN, i1}` stored as N/8 limbs followed by the overflow flag cell.
-    fn with_overflow(&mut self, c: &instruction::Call, name: &str) -> Result<()> {
-        let dest = c.dest.as_ref().unwrap();
-        let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    fn with_overflow(&mut self, inst: &Instr, args: &[&Operand], name: &str) -> Result<()> {
+        let dest = inst.dest.unwrap();
         let n = limbs(self.op_bits(args[0])?);
         let (cell, size) = self.slot(dest)?;
-        let (_, flag_off) = self.ti.element(&self.module.type_of(c), 1)?;
+        let (_, flag_off) = self.types().element(inst.ty, 1)?;
         for k in 0..size {
             self.e.clear(cell + k as Cell);
         }

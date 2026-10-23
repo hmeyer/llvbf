@@ -17,20 +17,12 @@ mod instr;
 mod intrinsics;
 mod memory;
 
-use instr::Cast;
-
 use crate::arith::*;
-use crate::assist::GepTable;
 use crate::emit::{Cell, Emitter};
+use crate::ir::*;
 use crate::plan::*;
-use crate::types::TypeInfo;
-use anyhow::{anyhow, bail, Context, Result};
-use either::Either;
-use llvm_ir::instruction::{self, Instruction};
-use llvm_ir::predicates::IntPredicate;
-use llvm_ir::terminator::Terminator;
-use llvm_ir::{Module, Name, Operand, Type, TypeRef};
-use std::collections::HashMap;
+use anyhow::{anyhow, bail, Context as _, Result};
+use instr::Cast;
 
 pub struct Options {
     /// Size of addressable memory in bytes (multiple of 256, at most 65536).
@@ -162,58 +154,51 @@ struct SegRef {
 }
 
 struct Gen<'a> {
-    module: &'a Module,
-    ti: &'a TypeInfo<'a>,
+    m: &'a Module,
     plan: &'a Plan,
-    geps: &'a GepTable,
     lay: Layout,
     opts: &'a Options,
     e: Emitter,
     sc: Scratch,
-    func_ids: HashMap<String, u16>,
+    /// Entry segment id of each function, by `FuncId` (`None` for declarations).
+    func_entry: Vec<Option<u16>>,
+    /// Index into `plan.funcs` of the function being emitted.
     cur: usize,
 }
 
 /// Compile a module to Brainfuck.
-pub fn compile(module: &Module, geps: &GepTable, opts: &Options) -> Result<Vec<u8>> {
+pub fn compile(m: &Module, opts: &Options) -> Result<Vec<u8>> {
     if opts.mem_size % 256 != 0 || opts.mem_size == 0 || opts.mem_size > 65536 {
         bail!("memory size must be a positive multiple of 256 and at most 65536");
     }
-    let ti = TypeInfo::new(module);
-    let plan = plan_module(module, &ti, geps, opts.mem_size, &opts.entry)?;
+    let plan = plan_module(m, opts.mem_size, &opts.entry)?;
     // Pass 1 measures the scratch requirement, pass 2 emits the final code.
-    let (hw, _) = run_gen(module, &ti, &plan, geps, opts, 4096)?;
-    let (_, code) = run_gen(module, &ti, &plan, geps, opts, hw + 4)?;
+    let (hw, _) = run_gen(m, &plan, opts, 4096)?;
+    let (_, code) = run_gen(m, &plan, opts, hw + 4)?;
     Ok(code)
 }
 
 fn run_gen(
-    module: &Module,
-    ti: &TypeInfo,
+    m: &Module,
     plan: &Plan,
-    geps: &GepTable,
     opts: &Options,
     scratch_size: usize,
 ) -> Result<(usize, Vec<u8>)> {
-    let lay = Layout::new(plan, ti.ptr_bytes, scratch_size);
+    let lay = Layout::new(plan, m.types.ptr_bytes, scratch_size);
     let mut e = Emitter::new();
     e.comments = opts.comments;
     let sc = Scratch::new(lay.scratch);
-    let func_ids = plan
-        .funcs
-        .iter()
-        .map(|f| (f.name.clone(), f.entry_id))
+    let func_entry = (0..m.functions.len())
+        .map(|fid| plan.entry_of(fid))
         .collect();
     let mut g = Gen {
-        module,
-        ti,
+        m,
         plan,
-        geps,
         lay,
         opts,
         e,
         sc,
-        func_ids,
+        func_entry,
         cur: 0,
     };
     g.emit_program()?;
@@ -225,13 +210,15 @@ fn run_gen(
 }
 
 impl<'a> Gen<'a> {
+    fn types(&self) -> &'a TypeTable {
+        &self.m.types
+    }
+
     fn ce(&self) -> ConstEval<'_> {
         ConstEval {
-            module: self.module,
-            ti: self.ti,
-            geps: self.geps,
-            globals: &self.plan.globals,
-            func_ids: &self.func_ids,
+            types: &self.m.types,
+            global_addr: &self.plan.global_addr,
+            func_entry: &self.func_entry,
         }
     }
 
@@ -239,8 +226,8 @@ impl<'a> Gen<'a> {
         &self.plan.funcs[self.cur]
     }
 
-    fn func(&self) -> &'a llvm_ir::Function {
-        &self.module.functions[self.fp().fidx]
+    fn func(&self) -> &'a Function {
+        &self.m.functions[self.fp().fid]
     }
 
     fn comment(&mut self, s: &str) {
@@ -248,12 +235,12 @@ impl<'a> Gen<'a> {
     }
 
     /// Cell and size of the slot of an SSA value in the current frame.
-    fn slot(&self, name: &Name) -> Result<(Cell, usize)> {
+    fn slot(&self, v: Value) -> Result<(Cell, usize)> {
         let s = self
             .fp()
             .slots
-            .get(name)
-            .ok_or_else(|| anyhow!("unknown value %{}", name))?;
+            .get(&v)
+            .ok_or_else(|| anyhow!("unknown value {}", v))?;
         Ok((self.slot_cell(s), s.size))
     }
 
@@ -264,12 +251,8 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn op_type(&self, op: &Operand) -> TypeRef {
-        self.module.type_of(op)
-    }
-
     fn op_bits(&self, op: &Operand) -> Result<u32> {
-        self.ti.scalar_bits(&self.op_type(op))
+        self.types().bits(op.ty)
     }
 
     fn ptr_limbs(&self) -> usize {
@@ -278,34 +261,32 @@ impl<'a> Gen<'a> {
 
     /// Load a scalar operand into a zeroed work area (zero-extending if the work is wider).
     fn load_operand(&mut self, op: &Operand, w: Work) -> Result<()> {
-        match op {
-            Operand::LocalOperand { name, .. } => {
-                let (cell, size) = self.slot(name)?;
+        match &op.kind {
+            OperandKind::Value(v) => {
+                let (cell, size) = self.slot(*v)?;
                 let n = w.n.min(size);
                 load_packed(&mut self.e, &mut self.sc, cell, w.truncated(n));
             }
-            Operand::ConstantOperand(c) => {
-                let v = self.ce().scalar(c)?;
+            OperandKind::Const(_) => {
+                let v = self.ce().operand_scalar(op)?;
                 load_const(&mut self.e, w, v);
             }
-            Operand::MetadataOperand => bail!("metadata operand in value position"),
         }
         Ok(())
     }
 
     /// Bytes `off..off+n` of an operand's in-memory representation into a work area.
     fn load_operand_bytes(&mut self, op: &Operand, off: usize, w: Work) -> Result<()> {
-        match op {
-            Operand::LocalOperand { name, .. } => {
-                let (cell, size) = self.slot(name)?;
+        match &op.kind {
+            OperandKind::Value(v) => {
+                let (cell, size) = self.slot(*v)?;
                 if off + w.n > size {
-                    bail!("byte range out of slot bounds for %{}", name);
+                    bail!("byte range out of slot bounds for {}", v);
                 }
                 load_packed(&mut self.e, &mut self.sc, cell + off as Cell, w);
             }
-            Operand::ConstantOperand(c) => {
-                let ty = self.op_type(op);
-                let bytes = self.ce().bytes(c, &ty)?;
+            OperandKind::Const(c) => {
+                let bytes = self.ce().bytes(c, op.ty)?;
                 for k in 0..w.n {
                     let b = bytes.get(off + k).copied().unwrap_or(0);
                     if b != 0 {
@@ -313,14 +294,22 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
-            Operand::MetadataOperand => bail!("metadata operand in value position"),
         }
         Ok(())
     }
 
-    /// Store a work area into the slot of `name`, clearing the whole slot first.
-    fn store_result(&mut self, name: &Name, w: Work) -> Result<()> {
-        let (cell, size) = self.slot(name)?;
+    /// Load an operand of any type into a work area sized for it.
+    fn load_any(&mut self, op: &Operand, w: Work) -> Result<()> {
+        if self.types().is_scalar(op.ty) {
+            self.load_operand(op, w)
+        } else {
+            self.load_operand_bytes(op, 0, w)
+        }
+    }
+
+    /// Store a work area into the slot of `v`, clearing the whole slot first.
+    fn store_result(&mut self, v: Value, w: Work) -> Result<()> {
+        let (cell, size) = self.slot(v)?;
         self.store_to_cells(cell, size, w);
         Ok(())
     }
@@ -461,7 +450,7 @@ impl<'a> Gen<'a> {
         let lay = self.lay.clone();
         if id == self.plan.start_id {
             self.comment("_start: call entry function");
-            let entry_idx = self.plan.func_by_name[&self.opts.entry];
+            let entry_idx = self.plan.func_by_name(&self.opts.entry).unwrap();
             let entry_id = self.plan.funcs[entry_idx].entry_id;
             let f = lay.frame;
             // Parameters of main (argc, argv) are left zero.
@@ -488,7 +477,7 @@ impl<'a> Gen<'a> {
         self.cur = func;
         let fp = self.fp();
         let f = self.func();
-        let bb = &f.basic_blocks[block];
+        let bb = &f.blocks[block];
         let s = &fp.blocks[block].segments[seg];
         self.comment(&format!(
             "segment {} = {} / %{} / {}",
@@ -506,18 +495,18 @@ impl<'a> Gen<'a> {
             match *step {
                 Step::Instr(i) => {
                     if self.opts.comments {
-                        self.comment(&format!("{}", bb.instrs[i]));
+                        self.comment(&bb.instrs[i].text);
                     }
-                    self.emit_instr(bb, i)
-                        .with_context(|| format!("in {}: {}", fp.name, bb.instrs[i]))?;
+                    self.emit_instr(block, bb, i)
+                        .with_context(|| format!("in {}: {}", fp.name, bb.instrs[i].text))?;
                 }
                 Step::VaSetup(i) => {
                     self.comment("variadic call: reserve spill area");
-                    let call = match &bb.instrs[i] {
-                        Instruction::Call(c) => c,
+                    let (fn_ty, args) = match &bb.instrs[i].op {
+                        Op::Call { fn_ty, args, .. } => (*fn_ty, args),
                         _ => unreachable!(),
                     };
-                    let (_, total) = va_spill_layout(self.module, self.ti, call)?;
+                    let (_, total) = va_spill_layout(self.types(), fn_ty, args)?;
                     self.adjust_msp((total as u64).wrapping_neg());
                 }
             }
@@ -526,17 +515,17 @@ impl<'a> Gen<'a> {
         match &s.end {
             SegEnd::Term => {
                 if self.opts.comments {
-                    self.comment(&format!("{}", bb.term));
+                    self.comment(&bb.term_text);
                 }
-                self.emit_terminator(bb, s)
-                    .with_context(|| format!("in {}: {}", fp.name, bb.term))?
+                self.emit_terminator(block, bb)
+                    .with_context(|| format!("in {}: {}", fp.name, bb.term_text))?;
             }
             SegEnd::Call(i) => self
                 .emit_call(bb, *i, s)
-                .with_context(|| format!("in {}: {}", fp.name, bb.instrs[*i]))?,
+                .with_context(|| format!("in {}: {}", fp.name, bb.instrs[*i].text))?,
             SegEnd::Access(a) => self
                 .emit_access(block, bb, *a, s)
-                .with_context(|| format!("in {}: {}", fp.name, bb.instrs[a.instr]))?,
+                .with_context(|| format!("in {}: {}", fp.name, bb.instrs[a.instr].text))?,
         }
         self.sc.release(m);
         Ok(())

@@ -3,112 +3,102 @@
 use super::*;
 
 impl<'a> Gen<'a> {
-    pub(super) fn block_id(&self, name: &Name) -> Result<u16> {
-        self.fp()
-            .block_ids
-            .get(name)
-            .copied()
-            .ok_or_else(|| anyhow!("unknown block %{}", name))
+    fn block_id(&self, b: BlockId) -> u16 {
+        self.fp().block_ids[b]
     }
 
     /// Emit the phi moves for the edge `from -> to`, then set the pc to `to`.
-    pub(super) fn branch_to(&mut self, from: &Name, to: &Name) -> Result<()> {
-        let f = self.func();
-        let dest = f
-            .basic_blocks
-            .iter()
-            .find(|b| &b.name == to)
-            .ok_or_else(|| anyhow!("unknown block %{}", to))?;
+    /// All incoming values are read into scratch before any phi slot is written,
+    /// which makes the copies parallel (phis may read each other's old values).
+    fn branch_to(&mut self, from: BlockId, to: BlockId) -> Result<()> {
+        let dest = &self.func().blocks[to];
         let m = self.sc.mark();
-        let mut pending: Vec<(Name, Work)> = Vec::new();
-        for inst in &dest.instrs {
-            if let Instruction::Phi(phi) = inst {
-                let (_, size) = self.slot(&phi.dest)?;
-                let w = Work::alloc(&mut self.sc, size);
-                let (val, _) = phi
-                    .incoming_values
-                    .iter()
-                    .find(|(_, b)| b == from)
-                    .ok_or_else(|| {
-                        anyhow!("phi %{} has no incoming value from %{}", phi.dest, from)
-                    })?;
-                if self.ti.is_scalar(&phi.to_type) {
-                    self.load_operand(val, w)?;
-                } else {
-                    self.load_operand_bytes(val, 0, w)?;
-                }
-                pending.push((phi.dest.clone(), w));
-            } else {
-                break;
-            }
+        let mut pending: Vec<(Value, Work)> = Vec::new();
+        for phi in &dest.phis {
+            let (_, size) = self.slot(phi.dest)?;
+            let w = Work::alloc(&mut self.sc, size);
+            let (val, _) = phi
+                .incoming
+                .iter()
+                .find(|(_, b)| *b == from)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "phi {} has no incoming value from %{}",
+                        phi.dest,
+                        self.func().blocks[from].name
+                    )
+                })?;
+            self.load_any(val, w)?;
+            pending.push((phi.dest, w));
         }
-        for (name, w) in pending {
-            self.store_result(&name, w)?;
+        for (v, w) in pending {
+            self.store_result(v, w)?;
         }
         self.sc.release(m);
-        let id = self.block_id(to)?;
+        let id = self.block_id(to);
         self.set_pc(0, id);
         Ok(())
     }
 
-    pub(super) fn emit_terminator(
-        &mut self,
-        bb: &llvm_ir::BasicBlock,
-        _seg: &Segment,
-    ) -> Result<()> {
+    pub(super) fn emit_terminator(&mut self, block: BlockId, bb: &Block) -> Result<()> {
         match &bb.term {
-            Terminator::Ret(r) => self.emit_ret(r),
-            Terminator::Br(br) => self.branch_to(&bb.name, &br.dest),
-            Terminator::CondBr(cb) => {
+            Terminator::Ret(v) => self.emit_ret(v),
+            Terminator::Br(dest) => self.branch_to(block, *dest),
+            Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } => {
                 let m = self.sc.mark();
                 let c = Work::alloc(&mut self.sc, 1);
-                self.load_operand(&cb.condition, c)?;
+                self.load_operand(cond, c)?;
                 let flag = self.sc.alloc(1);
                 self.e.begin_if_else(c.limb(0), flag);
-                self.branch_to(&bb.name, &cb.false_dest)?;
+                self.branch_to(block, *if_false)?;
                 self.e.else_if_else(c.limb(0), flag);
-                self.branch_to(&bb.name, &cb.true_dest)?;
+                self.branch_to(block, *if_true)?;
                 self.e.end_if_else(flag);
                 self.e.clear(c.limb(0));
                 self.sc.release(m);
                 Ok(())
             }
-            Terminator::Switch(sw) => {
-                let bits = self.op_bits(&sw.operand)?;
-                let n = limbs(bits);
+            Terminator::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                let n = limbs(self.op_bits(value)?);
                 let m = self.sc.mark();
                 let w = Work::alloc(&mut self.sc, n);
-                self.load_operand(&sw.operand, w)?;
+                self.load_operand(value, w)?;
                 let done = Work::alloc(&mut self.sc, 1);
-                for (c, dest) in &sw.dests {
+                for (c, dest) in cases {
                     let m2 = self.sc.mark();
                     let cw = Work::alloc(&mut self.sc, n);
-                    let v = self.ce().scalar(c)?;
-                    load_const(&mut self.e, cw, v);
+                    load_const(&mut self.e, cw, *c);
                     let flag = Work::alloc(&mut self.sc, 1);
                     eq(&mut self.e, &mut self.sc, w, cw, flag.limb(0));
                     clear_work(&mut self.e, cw);
                     let f2 = self.sc.alloc(1);
                     self.e.begin_if_nonzero(flag.limb(0), f2);
                     self.e.inc(done.limb(0));
-                    self.branch_to(&bb.name, dest)?;
+                    self.branch_to(block, *dest)?;
                     self.e.end_if_nonzero(f2);
                     self.e.clear(flag.limb(0));
                     self.sc.release(m2);
                 }
                 self.e.begin_if_zero(done.limb(0));
-                self.branch_to(&bb.name, &sw.default_dest)?;
+                self.branch_to(block, *default)?;
                 self.e.end_if_zero(done.limb(0));
                 self.e.clear(done.limb(0));
                 clear_work(&mut self.e, w);
                 self.sc.release(m);
                 Ok(())
             }
-            Terminator::Unreachable(_) => {
+            Terminator::Unreachable => {
                 self.e.clear(self.lay.active);
                 Ok(())
             }
-            t => bail!("unsupported terminator {}", t),
         }
     }
 }

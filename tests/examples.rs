@@ -24,8 +24,12 @@ fn run_example(name: &str, input: &[u8]) -> String {
 }
 
 fn check(name: &str, input: &[u8]) {
-    let expected = std::fs::read_to_string(root().join("examples/expected").join(format!("{}.txt", name)))
-        .unwrap_or_else(|_| panic!("missing expected output for {}", name));
+    let expected = std::fs::read_to_string(
+        root()
+            .join("examples/expected")
+            .join(format!("{}.txt", name)),
+    )
+    .unwrap_or_else(|_| panic!("missing expected output for {}", name));
     assert_eq!(run_example(name, input), expected, "output of {}", name);
 }
 
