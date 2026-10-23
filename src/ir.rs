@@ -97,6 +97,20 @@ impl TypeTable {
     pub fn size(&self, id: TypeId) -> usize {
         self.types[id].size
     }
+    /// Bytes a pointer value occupies in a frame slot and in address arithmetic. The
+    /// address space is at most 64 KiB, so on the 32-bit target the two high bytes of
+    /// a pointer are always zero and are not stored; in memory a pointer keeps its
+    /// full `ptr_bytes` (the data layout LLVM assumed).
+    pub fn addr_bytes(&self) -> usize {
+        self.ptr_bytes.min(2)
+    }
+    /// Bytes of a value's frame slot: its memory size, except for pointers.
+    pub fn slot_size(&self, id: TypeId) -> usize {
+        match self.kind(id) {
+            TypeKind::Ptr => self.addr_bytes(),
+            _ => self.size(id),
+        }
+    }
     pub fn align(&self, id: TypeId) -> usize {
         self.types[id].align
     }

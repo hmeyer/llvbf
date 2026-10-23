@@ -156,7 +156,7 @@ impl<'a> Gen<'a> {
 
     fn icmp(&mut self, pred: Pred, a: &Operand, b: &Operand, dest: Value) -> Result<()> {
         let bits = self.op_bits(a)?;
-        let n = limbs(bits);
+        let n = self.operand_limbs(a)?;
         let m = self.sc.mark();
         // `a` gets an extra limb so that the borrow of a - b lands in it.
         let wa = Work::alloc(&mut self.sc, n + 1);
@@ -247,7 +247,7 @@ impl<'a> Gen<'a> {
         if_false: &Operand,
         dest: Value,
     ) -> Result<()> {
-        let size = self.types().size(if_true.ty);
+        let size = self.types().slot_size(if_true.ty);
         let m = self.sc.mark();
         let w = Work::alloc(&mut self.sc, size);
         self.load_any(if_false, w)?;
@@ -350,7 +350,7 @@ impl<'a> Gen<'a> {
         let size = self.types().size(ty) as u64 * count;
         // Keep the memory stack pointer aligned to two pointers (variadic spill
         // areas rely on it).
-        let align = (align as u64).max(2 * self.ptr_limbs() as u64);
+        let align = (align as u64).max(2 * self.types().ptr_bytes as u64);
         let size = size.div_ceil(align) * align;
         let n = self.ptr_limbs();
         let m = self.sc.mark();
