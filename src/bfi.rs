@@ -35,6 +35,9 @@ enum Op {
 /// A compiled Brainfuck program.
 pub struct Program {
     ops: Vec<Op>,
+    /// For profiling: the comment marker (`# ...` line in the source) each op belongs to.
+    markers: Vec<String>,
+    op_marker: Vec<u32>,
 }
 
 /// Execution statistics.
@@ -51,7 +54,28 @@ impl Program {
         // Pass 1: tokenize with RLE.
         let mut ops: Vec<Op> = Vec::new();
         let mut depth_stack: Vec<usize> = Vec::new();
+        let mut markers: Vec<String> = vec!["(start)".to_string()];
+        let mut op_marker: Vec<u32> = Vec::new();
+        let mut line_start = true;
+        let mut comment: Option<String> = None;
         for c in src.bytes() {
+            // Comment lines ("# ...") become profiling markers.
+            if let Some(text) = comment.as_mut() {
+                if c == b'\n' {
+                    markers.push(text.trim().to_string());
+                    comment = None;
+                    line_start = true;
+                } else {
+                    text.push(c as char);
+                }
+                continue;
+            }
+            if line_start && c == b'#' {
+                comment = Some(String::new());
+                continue;
+            }
+            line_start = c == b'\n';
+            let before = ops.len();
             match c {
                 b'+' | b'-' => {
                     let d: u8 = if c == b'+' { 1 } else { 255 };
@@ -96,11 +120,45 @@ impl Program {
                 }
                 _ => {}
             }
+            // Keep the marker list aligned with the op list (ops may merge or be rewritten).
+            op_marker.truncate(ops.len().min(op_marker.len()));
+            while op_marker.len() < ops.len() {
+                op_marker.push((markers.len() - 1) as u32);
+            }
+            let _ = before;
         }
         if !depth_stack.is_empty() {
             bail!("unmatched '['");
         }
-        Ok(Program { ops })
+        Ok(Program {
+            ops,
+            markers,
+            op_marker,
+        })
+    }
+
+    /// Run and return, per comment marker, the number of ops executed under it,
+    /// sorted by count (descending). Needs a program compiled with `--comments`.
+    pub fn profile(&self, input: &[u8], max_steps: Option<u64>) -> Result<Vec<(String, u64)>> {
+        let mut counts = vec![0u64; self.markers.len()];
+        let mut out = Vec::new();
+        let mut inp = input;
+        self.run_on_tape(
+            &mut inp,
+            &mut out,
+            max_steps,
+            &mut vec![0; 1 << 16],
+            Some(&mut counts),
+        )?;
+        let mut v: Vec<(String, u64)> = self
+            .markers
+            .iter()
+            .cloned()
+            .zip(counts)
+            .filter(|(_, c)| *c > 0)
+            .collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        Ok(v)
     }
 
     /// Run the program with the given input, returning the output.
@@ -120,7 +178,7 @@ impl Program {
         let mut out = Vec::new();
         let mut inp = input;
         let mut tape: Vec<u8> = vec![0; 1 << 16];
-        let stats = self.run_on_tape(&mut inp, &mut out, max_steps, &mut tape)?;
+        let stats = self.run_on_tape(&mut inp, &mut out, max_steps, &mut tape, None)?;
         Ok((out, tape, stats))
     }
 
@@ -132,7 +190,7 @@ impl Program {
         max_steps: Option<u64>,
     ) -> Result<Stats> {
         let mut tape: Vec<u8> = vec![0; 1 << 16];
-        self.run_on_tape(input, output, max_steps, &mut tape)
+        self.run_on_tape(input, output, max_steps, &mut tape, None)
     }
 
     fn run_on_tape(
@@ -141,6 +199,7 @@ impl Program {
         output: &mut dyn Write,
         max_steps: Option<u64>,
         tape: &mut Vec<u8>,
+        mut profile: Option<&mut Vec<u64>>,
     ) -> Result<Stats> {
         let mut p: usize = 0;
         let mut pc: usize = 0;
@@ -164,6 +223,9 @@ impl Program {
             stats.steps += 1;
             if stats.steps > max_steps {
                 bail!("step limit of {} exceeded", max_steps);
+            }
+            if let Some(counts) = profile.as_deref_mut() {
+                counts[self.op_marker[pc] as usize] += 1;
             }
             match &ops[pc] {
                 Op::Add(d) => tape[p] = tape[p].wrapping_add(*d),
