@@ -11,6 +11,7 @@
 //! failures are reproducible.
 //!
 //! Needs `cc` on the host and the LLVM 23 tools llvbf itself needs.
+//! `LLVBF_FUZZ_TARGET=msp430` runs the batch in the 16-bit mode.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

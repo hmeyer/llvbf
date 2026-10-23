@@ -1,5 +1,6 @@
-//! The `llvbf cc` driver: compiles C sources with clang for a 16-bit target,
-//! links them with the llvbf runtime, optimizes and lowers to Brainfuck.
+//! The `llvbf cc` driver: compiles C sources with clang for a freestanding
+//! 32-bit (or, with `--target msp430`, 16-bit) target, links them with the llvbf
+//! runtime, optimizes and lowers to Brainfuck.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ impl Default for CcOptions {
         CcOptions {
             sources: vec![],
             output: None,
-            target: "msp430".to_string(),
+            target: DEFAULT_TARGET.to_string(),
             opt_level: "-Os".to_string(),
             extra_clang_args: vec![],
             runtime_dir: None,
@@ -37,6 +38,11 @@ impl Default for CcOptions {
 
 /// The LLVM major version llvbf is built against.
 pub const LLVM_VERSION: &str = "23";
+
+/// Default clang target: 32-bit `int` and pointers, a plain data layout, and a
+/// Tier 2 Rust target with a precompiled `core`. `--target msp430` selects the
+/// 16-bit mode (smaller and faster output, but `int` is 16 bits).
+pub const DEFAULT_TARGET: &str = "riscv32-unknown-elf";
 
 /// Locate an LLVM tool: `--llvm-bin`, then `LLVBF_LLVM_BIN`, then the versioned
 /// installation (`/usr/lib/llvm-23/bin`, `clang-23`), then the plain name.

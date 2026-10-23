@@ -11,7 +11,7 @@ int main(void) {
     printf("%lx >> 4 = %lx, << 4 = %lx\n", u, u >> 4, u << 4);
     printf("%lu & 0xFFFF = %lu\n", u, u & 0xFFFFUL);
     unsigned x = 60000u;
-    printf("%u + 10000 = %u (wraps at 16 bits)\n", x, x + 10000u);
+    printf("%u + 10000 = %u (unsigned int has %d bits)\n", x, x + 10000u, (int)(sizeof(unsigned) * 8));
     int neg = -12345;
     printf("%d %x %o\n", neg, (unsigned)neg, (unsigned)neg);
     long long big = 1LL << 40;

@@ -1,13 +1,13 @@
-add_overflow: 1 -25536
-sub_overflow: 1 25536
-uadd_overflow: 1 4464
-umul_overflow: 1 24464
-popcount(0x5555) = 8, clz(1) = 15, ctz(0x40) = 6
+add_overflow: 1 -294967296
+sub_overflow: 1 294967296
+uadd_overflow: 1 705032704
+umul_overflow: 1 605032704
+popcount(0x5555) = 8, clz(1) = 31, ctz(0x40) = 6
 bswap16(0x1234) = 3412
 abs(-5) = 5, labs(-70000) = 70000
-rotl16(0x8001, 1) = 3
-rotl16(0x8001, 8) = 180
-rotl16(0x8001, 15) = c000
+rotl16(0x8001, 1) = 10003
+rotl16(0x8001, 8) = 800180
+rotl16(0x8001, 15) = 4000c000
 swap: 4 3
 ack(2, 3) = 9
 0 is zero

@@ -4,7 +4,7 @@
 -123456789 / 7 = -17636684
 deadbeef >> 4 = deadbee, << 4 = eadbeef0
 3735928559 & 0xFFFF = 48879
-60000 + 10000 = 4464 (wraps at 16 bits)
--12345 cfc7 147707
+60000 + 10000 = 70000 (unsigned int has 32 bits)
+-12345 ffffcfc7 37777747707
 1<<40 has 64 bits
 1
