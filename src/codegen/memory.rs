@@ -3,7 +3,7 @@
 use super::*;
 
 impl<'a> Gen<'a> {
-    pub(super) fn access_kind_index(&self, is_store: bool, width: usize) -> Cell {
+    fn access_kind_index(&self, is_store: bool, width: usize) -> Cell {
         self.plan
             .access_kinds
             .iter()
@@ -11,21 +11,14 @@ impl<'a> Gen<'a> {
             .expect("access kind") as Cell
     }
 
-    pub(super) fn finish_load(
-        &mut self,
-        block: usize,
-        bb: &llvm_ir::BasicBlock,
-        a: Access,
-    ) -> Result<()> {
+    /// Emitted at the start of the segment after a load request: move the bytes the
+    /// memory routine delivered in `DATA` into the destination slot.
+    pub(super) fn finish_load(&mut self, block: usize, bb: &Block, a: Access) -> Result<()> {
+        let inst = &bb.instrs[a.instr];
         let (cell, size) = match a.role {
-            AccessRole::Plain => match &bb.instrs[a.instr] {
-                Instruction::Load(l) => self.slot(&l.dest)?,
-                _ => unreachable!(),
-            },
-            AccessRole::VaValue => match &bb.instrs[a.instr] {
-                Instruction::VAArg(v) => self.slot(&v.dest)?,
-                _ => unreachable!(),
-            },
+            AccessRole::Plain | AccessRole::VaValue => {
+                self.slot(inst.dest.ok_or_else(|| anyhow!("load without result"))?)?
+            }
             AccessRole::VaPtrLoad | AccessRole::VaCopyLoad => self.extra_slot(block, a.instr)?,
             _ => bail!("internal error: finish_load on a store"),
         };
@@ -40,15 +33,18 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// Issue a memory request: address (and data for stores) into the header cells,
+    /// set the request flag, and continue with the next segment.
     pub(super) fn emit_access(
         &mut self,
         block: usize,
-        bb: &llvm_ir::BasicBlock,
+        bb: &Block,
         a: Access,
         seg: &Segment,
     ) -> Result<()> {
         let lay = self.lay.clone();
         let n = self.ptr_limbs();
+        let inst = &bb.instrs[a.instr];
         self.comment(&format!(
             "memory {} of {} bytes at offset {} ({:?})",
             if a.is_store { "store" } else { "load" },
@@ -57,45 +53,22 @@ impl<'a> Gen<'a> {
             a.role
         ));
         let m = self.sc.mark();
-        // Address: the operand that holds the base pointer depends on the role.
+        // Address: which operand holds the base pointer depends on the role.
         let w = Work::alloc(&mut self.sc, n);
-        match a.role {
-            AccessRole::Plain => {
-                let addr_op = match &bb.instrs[a.instr] {
-                    Instruction::Load(l) => &l.address,
-                    Instruction::Store(s) => &s.address,
-                    _ => unreachable!(),
-                };
-                self.load_operand(addr_op, w)?;
-            }
-            AccessRole::VaPtrLoad | AccessRole::VaPtrStore => {
-                let v = match &bb.instrs[a.instr] {
-                    Instruction::VAArg(v) => v,
-                    _ => unreachable!(),
-                };
-                self.load_operand(&v.arg_list, w)?;
-            }
-            AccessRole::VaValue => {
+        match (a.role, &inst.op) {
+            (AccessRole::Plain, Op::Load { addr, .. })
+            | (AccessRole::Plain, Op::Store { addr, .. }) => self.load_operand(addr, w)?,
+            (AccessRole::VaPtrLoad, Op::VaArg { list })
+            | (AccessRole::VaPtrStore, Op::VaArg { list }) => self.load_operand(list, w)?,
+            (AccessRole::VaValue, _) => {
                 let (cell, _) = self.extra_slot(block, a.instr)?;
                 load_packed(&mut self.e, &mut self.sc, cell, w);
             }
-            AccessRole::VaStart | AccessRole::VaCopyStore => {
-                let c = match &bb.instrs[a.instr] {
-                    Instruction::Call(c) => c,
-                    _ => unreachable!(),
-                };
-                self.load_operand(&c.arguments[0].0, w)?;
-            }
-            AccessRole::VaCopyLoad => {
-                let c = match &bb.instrs[a.instr] {
-                    Instruction::Call(c) => c,
-                    _ => unreachable!(),
-                };
-                self.load_operand(&c.arguments[1].0, w)?;
-            }
-            AccessRole::VaSpill(_) => {
-                load_packed(&mut self.e, &mut self.sc, lay.msp, w);
-            }
+            (AccessRole::VaStart, Op::Call { args, .. })
+            | (AccessRole::VaCopyStore, Op::Call { args, .. }) => self.load_operand(&args[0], w)?,
+            (AccessRole::VaCopyLoad, Op::Call { args, .. }) => self.load_operand(&args[1], w)?,
+            (AccessRole::VaSpill(_), _) => load_packed(&mut self.e, &mut self.sc, lay.msp, w),
+            _ => bail!("internal error: access role does not match instruction"),
         }
         if a.off != 0 {
             add_const(&mut self.e, &mut self.sc, w, a.off as u64);
@@ -112,30 +85,23 @@ impl<'a> Gen<'a> {
         if a.is_store {
             let m = self.sc.mark();
             let dw = Work::alloc(&mut self.sc, a.width);
-            match a.role {
-                AccessRole::Plain => {
-                    let v = match &bb.instrs[a.instr] {
-                        Instruction::Store(s) => &s.value,
-                        _ => unreachable!(),
-                    };
-                    self.load_operand_bytes(v, a.off, dw)?;
+            match (a.role, &inst.op) {
+                (AccessRole::Plain, Op::Store { value, .. }) => {
+                    self.load_operand_bytes(value, a.off, dw)?
                 }
-                AccessRole::VaPtrStore => {
-                    let v = match &bb.instrs[a.instr] {
-                        Instruction::VAArg(v) => v,
-                        _ => unreachable!(),
-                    };
+                (AccessRole::VaPtrStore, _) => {
+                    // The advanced argument pointer: saved pointer + size of the argument slot.
                     let (cell, _) = self.extra_slot(block, a.instr)?;
                     let full = Work::alloc(&mut self.sc, n);
                     load_packed(&mut self.e, &mut self.sc, cell, full);
-                    let adv = va_slot_size(self.ti.size_of(&v.cur_type)?);
+                    let adv = va_slot_size(self.types().size(inst.ty));
                     add_const(&mut self.e, &mut self.sc, full, adv as u64);
                     for k in 0..a.width {
                         self.e.move_cell(full.limb(a.off + k), dw.limb(k));
                     }
                     clear_work(&mut self.e, full);
                 }
-                AccessRole::VaStart => {
+                (AccessRole::VaStart, _) => {
                     let s = self
                         .fp()
                         .va_slot
@@ -143,30 +109,25 @@ impl<'a> Gen<'a> {
                     let cell = self.slot_cell(&s);
                     load_packed(&mut self.e, &mut self.sc, cell + a.off as Cell, dw);
                 }
-                AccessRole::VaCopyStore => {
+                (AccessRole::VaCopyStore, _) => {
                     let (cell, _) = self.extra_slot(block, a.instr)?;
                     load_packed(&mut self.e, &mut self.sc, cell + a.off as Cell, dw);
                 }
-                AccessRole::VaSpill(k) => {
-                    let c = match &bb.instrs[a.instr] {
-                        Instruction::Call(c) => c,
-                        _ => unreachable!(),
-                    };
-                    let (layout, _) = va_spill_layout(self.module, self.ti, c)?;
-                    let fixed = c.arguments.len() - layout.len();
+                (AccessRole::VaSpill(k), Op::Call { fn_ty, args, .. }) => {
+                    let (layout, _) = va_spill_layout(self.types(), *fn_ty, args)?;
+                    let fixed = args.len() - layout.len();
                     let (aoff, _) = layout[k];
-                    let arg = &c.arguments[fixed + k].0;
-                    let ty = self.op_type(arg);
-                    if self.ti.is_scalar(&ty)
-                        && a.off - aoff == 0
-                        && a.width >= self.ti.size_of(&ty)?
+                    let arg = &args[fixed + k];
+                    if self.types().is_scalar(arg.ty)
+                        && a.off == aoff
+                        && a.width >= self.types().size(arg.ty)
                     {
                         self.load_operand(arg, dw)?;
                     } else {
                         self.load_operand_bytes(arg, a.off - aoff, dw)?;
                     }
                 }
-                _ => unreachable!(),
+                _ => bail!("internal error: store role does not match instruction"),
             }
             for k in 0..a.width {
                 self.e.clear(lay.data + k as Cell);
@@ -182,7 +143,7 @@ impl<'a> Gen<'a> {
 
     /// Move the given cells to the same offsets in the region `stride` cells away
     /// (the next frame or memory block). The caller re-anchors the origin afterwards.
-    pub(super) fn hop(&mut self, stride: Cell, cells: &[Cell]) {
+    fn hop(&mut self, stride: Cell, cells: &[Cell]) {
         for &c in cells {
             self.e.move_cell(c, c + stride);
         }
@@ -195,7 +156,8 @@ impl<'a> Gen<'a> {
         }
     }
 
-    pub(super) fn emit_memory_routine(&mut self, k: Cell, is_store: bool, width: usize) {
+    /// The shared routine servicing all accesses of one (kind, width).
+    fn emit_memory_routine(&mut self, k: Cell, is_store: bool, width: usize) {
         let lay = self.lay.clone();
         let f = lay.frame;
         let b = lay.block;
@@ -245,7 +207,7 @@ impl<'a> Gen<'a> {
         debug_assert_eq!(lay.t, wb_start + 2);
         debug_assert_eq!(lay.data, wb_start + 3);
         debug_assert_eq!(lay.ctl, lay.data + 8);
-        let block_end = wb_start + k; // first cell after the walking block (a memory data cell once aligned)
+        let block_end = wb_start + k; // first cell after the walking block
                                       // Move the block so that it ends right before data cell 0: shift by (ctl - block_end).
         let pre = lay.ctl - block_end;
         let cells: Vec<Cell> = (0..k).map(|i| wb_start + i).collect();

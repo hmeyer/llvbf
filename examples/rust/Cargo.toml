@@ -1,0 +1,17 @@
+# A no_std Rust program compiled to Brainfuck. See README.md in this directory.
+[package]
+name = "bf_rust_example"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+
+[workspace]

@@ -3,12 +3,15 @@
 use super::*;
 
 impl<'a> Gen<'a> {
-    pub(super) fn finish_call(&mut self, bb: &llvm_ir::BasicBlock, i: usize) -> Result<()> {
-        let call = match &bb.instrs[i] {
-            Instruction::Call(c) => c,
+    /// Emitted at the start of the segment after a call: fetch the return value from
+    /// the callee frame and release a variadic spill area.
+    pub(super) fn finish_call(&mut self, bb: &Block, i: usize) -> Result<()> {
+        let inst = &bb.instrs[i];
+        let (fn_ty, args) = match &inst.op {
+            Op::Call { fn_ty, args, .. } => (*fn_ty, args),
             _ => unreachable!(),
         };
-        if let Some(dest) = &call.dest {
+        if let Some(dest) = inst.dest {
             let (cell, size) = self.slot(dest)?;
             let f = self.lay.frame;
             for k in 0..size {
@@ -17,8 +20,8 @@ impl<'a> Gen<'a> {
                     .move_cell(f + self.lay.ret + k as Cell, cell + k as Cell);
             }
         }
-        if call_is_variadic(call) {
-            let (_, total) = va_spill_layout(self.module, self.ti, call)?;
+        if call_is_variadic(self.types(), fn_ty) {
+            let (_, total) = va_spill_layout(self.types(), fn_ty, args)?;
             self.adjust_msp(total as u64);
         }
         Ok(())
@@ -44,73 +47,78 @@ impl<'a> Gen<'a> {
         Ok((self.slot_cell(s), s.size))
     }
 
-    pub(super) fn param_offsets(&self, tys: &[TypeRef]) -> Result<Vec<(usize, usize)>> {
+    /// (offset, size) of each parameter in the parameter area, for a list of parameter types.
+    fn param_offsets(&self, tys: &[TypeId]) -> Vec<(usize, usize)> {
         let mut v = Vec::new();
         let mut off = 0;
-        for t in tys {
-            let s = self.ti.size_of(t)?;
+        for &t in tys {
+            let s = self.types().size(t);
             v.push((off, s));
             off += s;
         }
-        Ok(v)
+        v
     }
 
-    pub(super) fn emit_call(
-        &mut self,
-        bb: &llvm_ir::BasicBlock,
-        i: usize,
-        seg: &Segment,
-    ) -> Result<()> {
-        let call = match &bb.instrs[i] {
-            Instruction::Call(c) => c,
+    pub(super) fn emit_call(&mut self, bb: &Block, i: usize, seg: &Segment) -> Result<()> {
+        let (callee, fn_ty, args) = match &bb.instrs[i].op {
+            Op::Call {
+                callee,
+                fn_ty,
+                args,
+            } => (callee, *fn_ty, args),
             _ => unreachable!(),
         };
         let lay = self.lay.clone();
         let f = lay.frame;
-        let callee_op = match &call.function {
-            Either::Right(op) => op,
-            Either::Left(_) => bail!("inline assembly is not supported"),
-        };
-        // Resolve the callee: direct function, runtime function for an intrinsic, or indirect.
-        let mut direct: Option<usize> = None;
-        let mut rewritten = false;
-        let mut args: Vec<Operand> = call.arguments.iter().map(|(a, _)| a.clone()).collect();
-        if let Some(name) = callee_name(call) {
-            let target = match intrinsic_runtime_call(&name) {
-                Some(rt) => {
-                    args.truncate(3);
-                    rewritten = true;
-                    rt.to_string()
-                }
-                None => name,
-            };
-            let idx = self.plan.func_by_name.get(&target).ok_or_else(|| {
-                anyhow!(
-                    "call to undefined function @{} (link the llvbf runtime?)",
-                    target
-                )
-            })?;
-            direct = Some(*idx);
+        // Resolve the callee: a defined function (directly, or as the runtime function
+        // that implements an intrinsic) or a function pointer.
+        enum Target {
+            Plan(usize),
+            Pointer(Operand),
         }
-        // Parameter layout from the callee's declared types (direct) or the call's function type.
-        let variadic = !rewritten && call_is_variadic(call);
-        let param_tys: Vec<TypeRef> = if rewritten {
-            // Intrinsic rewritten to a runtime call: use the runtime function's own signature
-            // (operands are zero-extended / truncated to the parameter widths).
-            let callee = &self.module.functions[self.plan.funcs[direct.unwrap()].fidx];
-            callee.parameters.iter().map(|p| p.ty.clone()).collect()
-        } else {
-            match call.function_ty.as_ref() {
-                Type::FuncType { param_types, .. } => param_types.clone(),
-                t => bail!("call through non-function type {}", t),
+        let mut args: Vec<Operand> = args.clone();
+        let mut rewritten = false;
+        let target = match callee {
+            Callee::Intrinsic(name) => {
+                let rt = intrinsic_runtime_call(name)
+                    .ok_or_else(|| anyhow!("intrinsic {} is not a call", name))?;
+                args.truncate(3);
+                rewritten = true;
+                Target::Plan(self.plan.func_by_name(rt).ok_or_else(|| {
+                    anyhow!(
+                        "call to undefined function @{} (link the llvbf runtime?)",
+                        rt
+                    )
+                })?)
             }
+            Callee::Direct(fid) => {
+                let name = &self.m.functions[*fid].name;
+                Target::Plan(
+                    self.plan
+                        .func_plan
+                        .get(fid)
+                        .copied()
+                        .ok_or_else(|| anyhow!("call to undefined function @{}", name))?,
+                )
+            }
+            Callee::Indirect(op) => Target::Pointer(op.clone()),
         };
-        if let Some(idx) = direct {
-            let callee = &self.module.functions[self.plan.funcs[idx].fidx];
-            if callee.is_var_arg != variadic || callee.parameters.len() != param_tys.len() {
+        // Parameter layout: from the runtime function's own signature for rewritten
+        // intrinsics (operands are zero-extended / truncated to the parameter widths),
+        // otherwise from the call's function type.
+        let sig_ty = match (&target, rewritten) {
+            (Target::Plan(idx), true) => self.m.functions[self.plan.funcs[*idx].fid].ty,
+            _ => fn_ty,
+        };
+        let (param_tys, variadic) = self.types().func_sig(sig_ty)?;
+        let param_tys = param_tys.to_vec();
+        if let Target::Plan(idx) = &target {
+            let callee_fn = &self.m.functions[self.plan.funcs[*idx].fid];
+            let (callee_params, callee_variadic) = self.types().func_sig(callee_fn.ty)?;
+            if callee_variadic != variadic || callee_params.len() != param_tys.len() {
                 bail!(
                     "call signature does not match the definition of @{}",
-                    callee.name
+                    callee_fn.name
                 );
             }
         }
@@ -121,7 +129,7 @@ impl<'a> Gen<'a> {
                 param_tys.len()
             );
         }
-        let offs = self.param_offsets(&param_tys)?;
+        let offs = self.param_offsets(&param_tys);
         let fixed_size: usize = offs.iter().map(|(_, s)| *s).sum();
         args.truncate(param_tys.len());
         self.comment("call: pass arguments");
@@ -129,7 +137,7 @@ impl<'a> Gen<'a> {
             let (off, size) = offs[k];
             let m = self.sc.mark();
             let w = Work::alloc(&mut self.sc, size);
-            if self.ti.is_scalar(&param_tys[k]) {
+            if self.types().is_scalar(param_tys[k]) {
                 self.load_operand(arg, w)?;
             } else {
                 self.load_operand_bytes(arg, 0, w)?;
@@ -154,16 +162,16 @@ impl<'a> Gen<'a> {
         }
         self.e.set(f + lay.active, 1);
         self.e.clear(f + lay.home);
-        match direct {
-            Some(idx) => {
-                let id = self.plan.funcs[idx].entry_id;
+        match &target {
+            Target::Plan(idx) => {
+                let id = self.plan.funcs[*idx].entry_id;
                 self.set_pc(f, id);
             }
-            None => {
-                let m = self.sc.mark();
+            Target::Pointer(op) => {
                 let pl = self.ptr_limbs();
+                let m = self.sc.mark();
                 let w = Work::alloc(&mut self.sc, pl);
-                self.load_operand(callee_op, w)?;
+                self.load_operand(op, w)?;
                 self.e.clear(f + lay.pc_lo);
                 self.e.clear(f + lay.pc_hi);
                 self.e.move_cell(w.limb(0), f + lay.pc_lo);
@@ -174,23 +182,19 @@ impl<'a> Gen<'a> {
         }
         self.prepare_dispatch_cells(f);
         self.set_pc(0, seg.id + 1);
+        // The logical frame shift: all following code addresses the callee frame.
         let p = self.e.pos();
         self.e.set_pos(p - f);
         Ok(())
     }
 
-    pub(super) fn emit_ret(&mut self, ret: &llvm_ir::terminator::Ret) -> Result<()> {
+    pub(super) fn emit_ret(&mut self, value: &Option<Operand>) -> Result<()> {
         let lay = self.lay.clone();
-        if let Some(op) = &ret.return_operand {
-            let ty = self.op_type(op);
-            let size = self.ti.size_of(&ty)?;
+        if let Some(op) = value {
+            let size = self.types().size(op.ty);
             let m = self.sc.mark();
             let w = Work::alloc(&mut self.sc, size);
-            if self.ti.is_scalar(&ty) {
-                self.load_operand(op, w)?;
-            } else {
-                self.load_operand_bytes(op, 0, w)?;
-            }
+            self.load_any(op, w)?;
             self.store_to_cells(lay.ret, size, w);
             self.sc.release(m);
         }

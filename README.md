@@ -2,7 +2,8 @@
 
 `llvbf` compiles LLVM IR to Brainfuck. Anything that can be lowered to LLVM IR
 with a 16-bit (or 32-bit) pointer target can therefore be compiled to
-Brainfuck; the bundled driver does this for C with `clang`.
+Brainfuck; the bundled driver does this for C with `clang`, and
+[`examples/rust`](examples/rust) shows how to do it for Rust.
 
 ```
 $ cat hello.c
@@ -38,13 +39,20 @@ interpreters that use -1), which the runtime maps to `EOF`.
 
 ## Building
 
-`llvbf` is a Rust crate that links against LLVM 18 through the `llvm-ir` and `llvm-sys` crates.
+`llvbf` is a Rust crate that reads LLVM modules through `inkwell`/`llvm-sys` and therefore
+needs the LLVM 23 development files. llvbf tracks the newest LLVM release so that current
+`clang` and current Rust nightlies can feed it; LLVM can read IR from older releases, but not
+from newer ones.
 
 ```
-sudo apt-get install clang-18 llvm-18 llvm-18-dev libpolly-18-dev libzstd-dev
-cargo build --release
-cargo test            # unit tests + end-to-end tests of examples/*.c (needs clang)
+# Ubuntu/Debian: LLVM 23 from apt.llvm.org (https://apt.llvm.org/)
+sudo apt-get install clang-23 llvm-23 llvm-23-dev libpolly-23-dev libzstd-dev
+cargo build --release    # finds llvm-config-23; otherwise set LLVM_SYS_231_PREFIX=/usr/lib/llvm-23
+cargo test               # unit tests + end-to-end tests of examples/*.c (needs clang-23)
 ```
+
+The driver looks for `clang`, `llvm-link` and `opt` in `--llvm-bin`, `LLVBF_LLVM_BIN`,
+`/usr/lib/llvm-23/bin`, then as `clang-23` and finally as plain `clang`.
 
 ## Usage
 
@@ -72,9 +80,15 @@ scan loops in constant time. The generated code relies on this heavily (see Perf
 C ──clang──▶ LLVM IR ──llvm-link/opt──▶ one module ──plan──▶ segments, slots, globals ──codegen──▶ Brainfuck
 ```
 
-* `assist.rs` re-reads the module with the LLVM C API to compute the byte offsets of constant
-  `getelementptr` expressions (the `llvm-ir` crate drops their source element type).
-* `types.rs` computes sizes and layouts from the module's data layout.
+* `ir.rs` is the *snapshot IR*: a plain, owned, lifetime-free Rust model of exactly what the
+  lowering consumes (interned types with sizes and offsets, typed operands, constants with
+  pre-folded `getelementptr` offsets, instructions as a `match`-able enum).
+* `loader/` builds it from an LLVM module through `inkwell`'s safe API. The five things `inkwell`
+  does not expose (switch case values, constant expressions, array constant elements, metadata
+  arguments, the function type of an indirect call) are wrapped in `loader/raw.rs`, the only
+  `unsafe` code in the crate; each wrapper checks its preconditions and documents what it relies
+  on. The loader is the only place that changes when LLVM does, and constructs the backend cannot
+  lower are rejected here with the LLVM text of the offending value.
 * `plan.rs` assigns a 16-bit id to every *segment* (see below), a frame slot to every SSA value and
   an address to every global.
 * `emit.rs` is the Brainfuck emitter with position tracking and the constant-time `if_zero` idiom.
@@ -178,6 +192,15 @@ multiplication is shift-and-add; division is restoring long division; signed ope
 unsigned ones by flipping sign bits; bitwise operations decompose limbs into bits. Everything is
 unit-tested against native arithmetic (`cargo test`).
 
+## Rust (and other frontends)
+
+Any LLVM frontend works if it can target 16-bit pointers and emit a module with no floats.
+For Rust, `examples/rust` is a `no_std` crate built with a nightly, `-Zbuild-std=core` for
+`msp430-none-elf`, `panic = "abort"` and `lto = "fat"`; the LTO'd `--emit=llvm-ir` output is
+self-contained and `llvbf cc` links the C runtime for `memset`. The nightly's LLVM must not be
+newer than llvbf's (`rustc +nightly -vV` shows it). `cargo test` runs this example when such a
+nightly is installed and skips it otherwise.
+
 ## Performance
 
 Numbers for the examples, compiled with `-Os` and run with `llvbf run`:
@@ -228,8 +251,8 @@ IR has no floats; `-target i386` gives 32-bit `int` and roughly four times slowe
 * Structured control flow (relooper) for loops inside a function would avoid the dispatch chain
   for the hottest edges.
 * 16-bit cell mode (one limb per `int`).
-* Other frontends: Rust and Zig produce suitable IR for `no_std` programs with a 16-bit target
-  spec; the runtime hooks are just `__llvbf_putc`, `__llvbf_getc` and `__llvbf_exit`.
+* Other frontends: Zig and C++ (without exceptions and RTTI) should work like Rust does; the
+  runtime hooks are just `__llvbf_putc`, `__llvbf_getc` and `__llvbf_exit`.
 
 ## License
 

@@ -35,22 +35,29 @@ impl Default for CcOptions {
     }
 }
 
-/// Locate an LLVM tool, trying the plain name and the `-18` suffixed variant.
+/// The LLVM major version llvbf is built against.
+pub const LLVM_VERSION: &str = "23";
+
+/// Locate an LLVM tool: `--llvm-bin`, then `LLVBF_LLVM_BIN`, then the versioned
+/// installation (`/usr/lib/llvm-23/bin`, `clang-23`), then the plain name.
 fn find_tool(bin: &Option<PathBuf>, name: &str) -> Result<PathBuf> {
-    let candidates: Vec<PathBuf> = match bin {
-        Some(dir) => vec![dir.join(name), dir.join(format!("{}-18", name))],
-        None => {
-            let mut v = vec![];
-            if let Ok(p) = std::env::var("LLVBF_LLVM_BIN") {
-                v.push(PathBuf::from(&p).join(name));
-                v.push(PathBuf::from(&p).join(format!("{}-18", name)));
-            }
-            v.push(PathBuf::from(name));
-            v.push(PathBuf::from(format!("{}-18", name)));
-            v.push(PathBuf::from(format!("/usr/lib/llvm-18/bin/{}", name)));
-            v
+    let versioned = format!("{}-{}", name, LLVM_VERSION);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = bin {
+        candidates.push(dir.join(name));
+        candidates.push(dir.join(&versioned));
+    } else {
+        if let Ok(p) = std::env::var("LLVBF_LLVM_BIN") {
+            candidates.push(PathBuf::from(&p).join(name));
+            candidates.push(PathBuf::from(&p).join(&versioned));
         }
-    };
+        candidates.push(PathBuf::from(format!(
+            "/usr/lib/llvm-{}/bin/{}",
+            LLVM_VERSION, name
+        )));
+        candidates.push(PathBuf::from(&versioned));
+        candidates.push(PathBuf::from(name));
+    }
     for c in candidates {
         if Command::new(&c)
             .arg("--version")
@@ -62,7 +69,8 @@ fn find_tool(bin: &Option<PathBuf>, name: &str) -> Result<PathBuf> {
         }
     }
     bail!(
-        "cannot find LLVM tool '{}' (set LLVBF_LLVM_BIN or --llvm-bin)",
+        "cannot find LLVM {} tool '{}' (set LLVBF_LLVM_BIN or --llvm-bin)",
+        LLVM_VERSION,
         name
     )
 }
@@ -153,13 +161,13 @@ pub fn compile_to_bitcode(opts: &CcOptions, work: &Path) -> Result<PathBuf> {
     run(&mut cmd)?;
     let optimized = work.join("optimized.bc");
     let mut cmd = Command::new(&opt);
+    // Size levels are expressed through the `optsize`/`minsize` function attributes
+    // that clang already set; the pipeline itself is O2 (opt rejects Os/Oz).
     let level = match opts.opt_level.as_str() {
         "-O0" => "default<O0>",
         "-O1" => "default<O1>",
-        "-O2" => "default<O2>",
         "-O3" => "default<O3>",
-        "-Oz" => "default<Oz>",
-        _ => "default<Os>",
+        _ => "default<O2>",
     };
     cmd.arg(format!("-passes=internalize,globaldce,{},globaldce", level))
         .arg(format!(

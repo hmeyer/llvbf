@@ -4,3 +4,5 @@
 *.ll
 !examples/**/*.ll
 /examples/**/out/
+/examples/rust/target
+/examples/rust/Cargo.lock
