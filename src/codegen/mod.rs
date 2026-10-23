@@ -7,6 +7,7 @@
 //!
 //! * `calls`      - calls, returns and the frame shift,
 //! * `memory`     - load/store requests and the shared memory routines,
+//! * `muldiv`     - multiplication/division requests and the shared routines,
 //! * `control`    - terminators and phi copies,
 //! * `instr`      - arithmetic, comparisons, casts, GEP, select, ...
 //! * `intrinsics` - builtins and LLVM intrinsics lowered inline.
@@ -16,6 +17,7 @@ mod control;
 mod instr;
 mod intrinsics;
 mod memory;
+mod muldiv;
 
 use crate::arith::*;
 use crate::emit::{Cell, Emitter};
@@ -23,6 +25,7 @@ use crate::ir::*;
 use crate::plan::*;
 use anyhow::{anyhow, bail, Context as _, Result};
 use instr::Cast;
+use std::collections::HashMap;
 
 pub struct Options {
     /// Size of addressable memory in bytes (multiple of 256, at most 65536).
@@ -64,10 +67,16 @@ pub struct Layout {
     pub t: Cell,
     pub data: Cell,
     pub msp: Cell,
-    pub scratch: Cell,
-    pub scratch_size: usize,
     pub ret: Cell,
     pub params: Cell,
+    /// Pool of block-local slots, placed next to scratch so that most operand
+    /// copies travel a short distance.
+    pub pool: Cell,
+    /// Operands and results of requests to the shared arithmetic routines.
+    pub arg: Cell,
+    pub scratch: Cell,
+    pub scratch_size: usize,
+    /// Dedicated slots of cross-block values and phis.
     pub locals: Cell,
     pub frame: Cell,
     pub ctl: Cell,
@@ -77,17 +86,28 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Frame layout: return value, parameters, control header, pooled slots,
+    /// arithmetic request cells, scratch, dedicated slots.
     fn new(plan: &Plan, ptr_bytes: usize, scratch_size: usize) -> Layout {
-        let active = 0;
-        let home = 1; // pads at 2, 3
-        let nothome = 4;
-        let pc_lo = 5;
-        let pc_hi = 6;
-        let ch_lo = 7; // pads 8, 9
-        let ch_hi = 10; // pads 11, 12
-        let tmp = 13;
-        let req = 14;
-        let addr_hi = req + plan.access_kinds.len().max(1) as Cell;
+        // Return value and parameters first: parameters at the frame start keep the
+        // caller's argument moves (into the next frame) short.
+        let ret = 0;
+        let params = ret + plan.ret_max as Cell;
+        // The control header follows. Every segment starts and ends in it (dispatch,
+        // pc) and memory requests pass through it, so it sits next to the pooled
+        // slots and the scratch area rather than at the frame start. The control
+        // area of each memory block mirrors the frame up to and including the header.
+        let active = params + plan.params_max as Cell;
+        let home = active + 1; // pads at +1, +2
+        let nothome = home + 3;
+        let pc_lo = nothome + 1;
+        let pc_hi = pc_lo + 1;
+        let ch_lo = pc_hi + 1; // pads +1, +2
+        let ch_hi = ch_lo + 3; // pads +1, +2
+        let tmp = ch_hi + 3;
+        let req = tmp + 1;
+        let num_req = plan.access_kinds.len() + plan.arith_kinds.len();
+        let addr_hi = req + num_req.max(1) as Cell;
         let hops = addr_hi + 1;
         let addr_lo = hops + 1;
         let cnt = addr_lo + 1;
@@ -95,10 +115,15 @@ impl Layout {
         let data = t + 1;
         let ctl = data + 8;
         let msp = ctl;
-        let scratch = msp + ptr_bytes as Cell;
-        let ret = scratch + scratch_size as Cell;
-        let params = ret + plan.ret_max as Cell;
-        let locals = params + plan.params_max as Cell;
+        // Then the pooled slots, the arithmetic request cells, the scratch area and
+        // the dedicated slots: the scratch area, which every operand passes through,
+        // sits between the two slot areas.
+        let pool = msp + ptr_bytes as Cell;
+        let arg = pool + plan.pool_max as Cell;
+        let scratch = arg + plan.arg_size as Cell;
+        // The scratch area also stages the arguments of calls.
+        let scratch_size = scratch_size.max(plan.params_max);
+        let locals = scratch + scratch_size as Cell;
         let frame = locals + plan.locals_max as Cell;
         Layout {
             active,
@@ -117,10 +142,12 @@ impl Layout {
             t,
             data,
             msp,
-            scratch,
-            scratch_size,
             ret,
             params,
+            pool,
+            arg,
+            scratch,
+            scratch_size,
             locals,
             frame,
             ctl,
@@ -164,6 +191,17 @@ struct Gen<'a> {
     func_entry: Vec<Option<u16>>,
     /// Index into `plan.funcs` of the function being emitted.
     cur: usize,
+    /// Remaining instruction-operand uses of the pooled values of the block being
+    /// emitted; a value whose count reaches zero is moved rather than copied.
+    uses_left: HashMap<Value, usize>,
+    /// True while emitting a terminator (phi copies, conditions, return values).
+    in_terminator: bool,
+    /// Cross-block values that die on the edge whose phi copies are being emitted.
+    edge_moves: Vec<Value>,
+    /// Cells beyond the frame the shared arithmetic routines clear before use
+    /// (measured in the first pass), and the most they used in this pass.
+    arith_ws: usize,
+    arith_hw: usize,
 }
 
 /// Compile a module to Brainfuck.
@@ -172,9 +210,9 @@ pub fn compile(m: &Module, opts: &Options) -> Result<Vec<u8>> {
         bail!("memory size must be a positive multiple of 256 and at most 65536");
     }
     let plan = plan_module(m, opts.mem_size, &opts.entry)?;
-    // Pass 1 measures the scratch requirement, pass 2 emits the final code.
-    let (hw, _) = run_gen(m, &plan, opts, 4096)?;
-    let (_, code) = run_gen(m, &plan, opts, hw + 4)?;
+    // Pass 1 measures the scratch requirements, pass 2 emits the final code.
+    let (hw, ws, _) = run_gen(m, &plan, opts, 4096, 0)?;
+    let (_, _, code) = run_gen(m, &plan, opts, hw + 4, ws)?;
     Ok(code)
 }
 
@@ -183,7 +221,8 @@ fn run_gen(
     plan: &Plan,
     opts: &Options,
     scratch_size: usize,
-) -> Result<(usize, Vec<u8>)> {
+    arith_ws: usize,
+) -> Result<(usize, usize, Vec<u8>)> {
     let lay = Layout::new(plan, m.types.ptr_bytes, scratch_size);
     let mut e = Emitter::new();
     e.comments = opts.comments;
@@ -200,13 +239,18 @@ fn run_gen(
         sc,
         func_entry,
         cur: 0,
+        uses_left: HashMap::new(),
+        in_terminator: false,
+        edge_moves: Vec::new(),
+        arith_ws,
+        arith_hw: 0,
     };
     g.emit_program()?;
     let used = g.sc.used();
     if used > scratch_size {
         bail!("internal error: scratch overflow");
     }
-    Ok((used, g.e.into_code()))
+    Ok((used, g.arith_hw, g.e.into_code()))
 }
 
 impl<'a> Gen<'a> {
@@ -234,7 +278,8 @@ impl<'a> Gen<'a> {
         self.e.comment(s);
     }
 
-    /// Cell and size of the slot of an SSA value in the current frame.
+    /// Cell and size of the slot of an SSA value in the current frame. The cell
+    /// after the slot (`cell + size`) is its zero pad.
     fn slot(&self, v: Value) -> Result<(Cell, usize)> {
         let s = self
             .fp()
@@ -247,8 +292,47 @@ impl<'a> Gen<'a> {
     fn slot_cell(&self, s: &Slot) -> Cell {
         match s.kind {
             SlotKind::Param => self.lay.params + s.off as Cell,
+            SlotKind::Pool => self.lay.pool + s.off as Cell,
             SlotKind::Local => self.lay.locals + s.off as Cell,
         }
+    }
+
+    /// Record a use of `v` and decide whether this use may consume (move) the value
+    /// instead of copying it. Pooled values qualify: all their uses are in one
+    /// block, so the textual order of uses is the execution order. Inside a
+    /// terminator a value may be moved if no instruction uses remain and the
+    /// terminator (including phi copies on every edge) mentions it exactly once.
+    /// Cross-block values qualify only as phi inputs that die on the current edge.
+    fn consume_use(&mut self, v: Value) -> bool {
+        if self.edge_moves.contains(&v) {
+            return true;
+        }
+        let fp = self.fp();
+        let Some(&term_uses) = fp.term_uses.get(&v) else {
+            return false;
+        };
+        if self.in_terminator {
+            return self.uses_left.get(&v).copied().unwrap_or(0) == 0 && term_uses == 1;
+        }
+        let left = self.uses_left.entry(v).or_insert(0);
+        *left = left.saturating_sub(1);
+        *left == 0 && term_uses == 0
+    }
+
+    /// Copy or move limbs `off..off+n` of a slot into consecutive scratch cells.
+    fn fetch_slot(&mut self, v: Value, off: usize, w: Work) -> Result<()> {
+        let (cell, size) = self.slot(v)?;
+        if off + w.n > size {
+            bail!("byte range out of slot bounds for {}", v);
+        }
+        if self.consume_use(v) {
+            for i in 0..w.n {
+                self.e.move_cell(cell + (off + i) as Cell, w.limb(i));
+            }
+        } else {
+            copy_packed(&mut self.e, cell + off as Cell, w, cell + size as Cell);
+        }
+        Ok(())
     }
 
     fn op_bits(&self, op: &Operand) -> Result<u32> {
@@ -263,9 +347,9 @@ impl<'a> Gen<'a> {
     fn load_operand(&mut self, op: &Operand, w: Work) -> Result<()> {
         match &op.kind {
             OperandKind::Value(v) => {
-                let (cell, size) = self.slot(*v)?;
+                let (_, size) = self.slot(*v)?;
                 let n = w.n.min(size);
-                load_packed(&mut self.e, &mut self.sc, cell, w.truncated(n));
+                self.fetch_slot(*v, 0, w.truncated(n))?;
             }
             OperandKind::Const(_) => {
                 let v = self.ce().operand_scalar(op)?;
@@ -278,13 +362,7 @@ impl<'a> Gen<'a> {
     /// Bytes `off..off+n` of an operand's in-memory representation into a work area.
     fn load_operand_bytes(&mut self, op: &Operand, off: usize, w: Work) -> Result<()> {
         match &op.kind {
-            OperandKind::Value(v) => {
-                let (cell, size) = self.slot(*v)?;
-                if off + w.n > size {
-                    bail!("byte range out of slot bounds for {}", v);
-                }
-                load_packed(&mut self.e, &mut self.sc, cell + off as Cell, w);
-            }
+            OperandKind::Value(v) => self.fetch_slot(*v, off, w)?,
             OperandKind::Const(c) => {
                 let bytes = self.ce().bytes(c, op.ty)?;
                 for k in 0..w.n {
@@ -307,10 +385,82 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Copy (or, on its last use, move) bytes `off..off+n` of an operand straight into
+    /// `n` consecutive cells at `dst`, which are cleared first. Used where a value only
+    /// needs to change place (arguments, memory requests), to avoid the detour through
+    /// scratch. Constants are set in place with the cell `tmp` near `dst` as the
+    /// temporary; `tmp` is cleared first (the pad of a slot being defined, or a cell of
+    /// a callee frame, may hold garbage) and left zero.
+    fn transfer_operand(
+        &mut self,
+        op: &Operand,
+        off: usize,
+        dst: Cell,
+        n: usize,
+        tmp: Cell,
+    ) -> Result<()> {
+        for i in 0..n {
+            self.e.clear(dst + i as Cell);
+        }
+        // `tmp` is the pad of a slot being defined or lies in a callee frame: clear it.
+        self.e.clear(tmp);
+        match &op.kind {
+            OperandKind::Value(v) => {
+                let (cell, size) = self.slot(*v)?;
+                let avail = size.saturating_sub(off).min(n);
+                let movable = self.consume_use(*v);
+                let tmp = cell + size as Cell;
+                for i in 0..avail {
+                    if movable {
+                        self.e.move_cell(cell + (off + i) as Cell, dst + i as Cell);
+                    } else {
+                        self.e
+                            .copy_cell(cell + (off + i) as Cell, dst + i as Cell, tmp);
+                    }
+                }
+            }
+            OperandKind::Const(c) => {
+                let bytes = if self.types().is_scalar(op.ty) {
+                    let x = self.ce().operand_scalar(op)?;
+                    (0..8)
+                        .map(|i| ((x >> (8 * i)) & 0xff) as u8)
+                        .collect::<Vec<u8>>()
+                } else {
+                    self.ce().bytes(c, op.ty)?
+                };
+                for i in 0..n {
+                    let b = bytes.get(off + i).copied().unwrap_or(0);
+                    self.e.set_using(dst + i as Cell, b, tmp);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear a slot about to be (re)defined, including its pad: the cells may hold
+    /// what a value that shared them left behind.
+    fn clear_slot(&mut self, cell: Cell, size: usize) {
+        for i in 0..=size {
+            self.e.clear(cell + i as Cell);
+        }
+    }
+
+    /// The slot of `v`, cleared for its definition (see [`clear_slot`]).
+    fn define_slot(&mut self, v: Value) -> Result<(Cell, usize)> {
+        let (cell, size) = self.slot(v)?;
+        self.clear_slot(cell, size);
+        Ok((cell, size))
+    }
+
     /// Store a work area into the slot of `v`, clearing the whole slot first.
     fn store_result(&mut self, v: Value, w: Work) -> Result<()> {
-        let (cell, size) = self.slot(v)?;
-        self.store_to_cells(cell, size, w);
+        let (cell, size) = self.define_slot(v)?;
+        for i in 0..w.n.min(size) {
+            self.e.move_cell(w.limb(i), cell + i as Cell);
+        }
+        for i in size..w.n {
+            self.e.clear(w.limb(i));
+        }
         Ok(())
     }
 
@@ -327,8 +477,11 @@ impl<'a> Gen<'a> {
     }
 
     fn set_pc(&mut self, base: Cell, id: u16) {
-        self.e.set(base + self.lay.pc_lo, (id & 0xff) as u8);
-        self.e.set(base + self.lay.pc_hi, (id >> 8) as u8);
+        let tmp = base + self.lay.tmp;
+        self.e
+            .set_using(base + self.lay.pc_lo, (id & 0xff) as u8, tmp);
+        self.e
+            .set_using(base + self.lay.pc_hi, (id >> 8) as u8, tmp);
     }
 
     /// Prepare the dispatch-chain idiom cells of the frame at `base` so that the
@@ -350,8 +503,17 @@ impl<'a> Gen<'a> {
     fn emit_program(&mut self) -> Result<()> {
         let lay = self.lay.clone();
         self.comment(&format!(
-            "llvbf output: {} memory blocks of {} cells, frame size {}, {} dispatch blocks",
-            lay.num_blocks, lay.block, lay.frame, self.plan.num_ids
+            "llvbf output: {} memory blocks of {} cells, frame size {} (control {}, ret {}, params {}, pool {}, scratch {}, locals {}), {} dispatch blocks",
+            lay.num_blocks,
+            lay.block,
+            lay.frame,
+            lay.pool - lay.active,
+            self.plan.ret_max,
+            self.plan.params_max,
+            self.plan.pool_max,
+            lay.scratch_size,
+            self.plan.locals_max,
+            self.plan.num_ids
         ));
         // Initialize global data (absolute addressing from tape cell 0).
         self.comment("initialize global data");
@@ -379,6 +541,7 @@ impl<'a> Gen<'a> {
         self.e.begin_while(lay.active);
         self.emit_dispatch()?;
         self.emit_memory_routines();
+        self.emit_arith_routines();
         self.e.end_while(lay.active);
         self.comment("end of program");
         Ok(())
@@ -453,12 +616,8 @@ impl<'a> Gen<'a> {
             let entry_idx = self.plan.func_by_name(&self.opts.entry).unwrap();
             let entry_id = self.plan.funcs[entry_idx].entry_id;
             let f = lay.frame;
-            // Parameters of main (argc, argv) are left zero.
-            for i in 0..self.ptr_limbs() {
-                self.e.clear(f + lay.msp + i as Cell);
-                self.e
-                    .copy_cell(lay.msp + i as Cell, f + lay.msp + i as Cell, lay.tmp);
-            }
+            // Parameters of main (argc, argv) are left zero; main's prologue fetches
+            // them (and the memory stack pointer) from this frame.
             self.e.set(f + lay.active, 1);
             self.e.clear(f + lay.home);
             self.set_pc(f, entry_id);
@@ -484,10 +643,14 @@ impl<'a> Gen<'a> {
             s.id, fp.name, bb.name, seg
         ));
         let m = self.sc.mark();
+        if block == 0 && seg == 0 {
+            self.emit_prologue()?;
+        }
         // Finish what the previous segment started.
         match &s.prev_end {
             Some(SegEnd::Access(a)) if !a.is_store => self.finish_load(block, bb, *a)?,
             Some(SegEnd::Call(i)) => self.finish_call(bb, *i)?,
+            Some(SegEnd::Arith(op)) => self.finish_arith(bb, *op)?,
             _ => {}
         }
         for step in &s.steps {
@@ -526,6 +689,9 @@ impl<'a> Gen<'a> {
             SegEnd::Access(a) => self
                 .emit_access(block, bb, *a, s)
                 .with_context(|| format!("in {}: {}", fp.name, bb.instrs[a.instr].text))?,
+            SegEnd::Arith(op) => self
+                .emit_arith_request(bb, *op, s)
+                .with_context(|| format!("in {}: {}", fp.name, bb.instrs[op.instr].text))?,
         }
         self.sc.release(m);
         Ok(())

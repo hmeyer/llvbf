@@ -12,10 +12,9 @@ impl<'a> Gen<'a> {
             _ => unreachable!(),
         };
         if let Some(dest) = inst.dest {
-            let (cell, size) = self.slot(dest)?;
+            let (cell, size) = self.define_slot(dest)?;
             let f = self.lay.frame;
             for k in 0..size {
-                self.e.clear(cell + k as Cell);
                 self.e
                     .move_cell(f + self.lay.ret + k as Cell, cell + k as Cell);
             }
@@ -48,17 +47,6 @@ impl<'a> Gen<'a> {
     }
 
     /// (offset, size) of each parameter in the parameter area, for a list of parameter types.
-    fn param_offsets(&self, tys: &[TypeId]) -> Vec<(usize, usize)> {
-        let mut v = Vec::new();
-        let mut off = 0;
-        for &t in tys {
-            let s = self.types().size(t);
-            v.push((off, s));
-            off += s;
-        }
-        v
-    }
-
     pub(super) fn emit_call(&mut self, bb: &Block, i: usize, seg: &Segment) -> Result<()> {
         let (callee, fn_ty, args) = match &bb.instrs[i].op {
             Op::Call {
@@ -129,37 +117,19 @@ impl<'a> Gen<'a> {
                 param_tys.len()
             );
         }
-        let offs = self.param_offsets(&param_tys);
-        let fixed_size: usize = offs.iter().map(|(_, s)| *s).sum();
+        let offs = param_offsets(self.types(), &param_tys);
         args.truncate(param_tys.len());
+        // Arguments are staged in this frame's scratch area (empty between segments),
+        // laid out like the callee's parameter slots; the callee's prologue moves them
+        // into its frame. The long move across the frame boundary is thus emitted once
+        // per function rather than once per call site.
         self.comment("call: pass arguments");
         for (k, arg) in args.iter().enumerate() {
             let (off, size) = offs[k];
-            let m = self.sc.mark();
-            let w = Work::alloc(&mut self.sc, size);
-            if self.types().is_scalar(param_tys[k]) {
-                self.load_operand(arg, w)?;
-            } else {
-                self.load_operand_bytes(arg, 0, w)?;
-            }
-            self.store_to_cells(f + lay.params + off as Cell, size, w);
-            self.sc.release(m);
-        }
-        if variadic {
-            // Hidden parameter: pointer to the spilled variadic arguments (current MSP).
-            let n = self.ptr_limbs();
-            let m = self.sc.mark();
-            let w = Work::alloc(&mut self.sc, n);
-            load_packed(&mut self.e, &mut self.sc, lay.msp, w);
-            self.store_to_cells(f + lay.params + fixed_size as Cell, n, w);
-            self.sc.release(m);
+            let dst = lay.scratch + off as Cell;
+            self.transfer_operand(arg, 0, dst, size, dst + size as Cell)?;
         }
         self.comment("call: set up callee frame");
-        for k in 0..self.ptr_limbs() {
-            self.e.clear(f + lay.msp + k as Cell);
-            self.e
-                .copy_cell(lay.msp + k as Cell, f + lay.msp + k as Cell, lay.tmp);
-        }
         self.e.set(f + lay.active, 1);
         self.e.clear(f + lay.home);
         match &target {
@@ -168,16 +138,11 @@ impl<'a> Gen<'a> {
                 self.set_pc(f, id);
             }
             Target::Pointer(op) => {
-                let pl = self.ptr_limbs();
-                let m = self.sc.mark();
-                let w = Work::alloc(&mut self.sc, pl);
-                self.load_operand(op, w)?;
-                self.e.clear(f + lay.pc_lo);
-                self.e.clear(f + lay.pc_hi);
-                self.e.move_cell(w.limb(0), f + lay.pc_lo);
-                self.e.move_cell(w.limb(1), f + lay.pc_hi);
-                clear_work(&mut self.e, w);
-                self.sc.release(m);
+                // A function pointer is an entry segment id: its low two bytes go
+                // straight into the callee's pc (the scratch area holds the staged
+                // arguments at this point).
+                self.transfer_operand(op, 0, f + lay.pc_lo, 1, f + lay.tmp)?;
+                self.transfer_operand(op, 1, f + lay.pc_hi, 1, f + lay.tmp)?;
             }
         }
         self.prepare_dispatch_cells(f);
@@ -185,6 +150,46 @@ impl<'a> Gen<'a> {
         // The logical frame shift: all following code addresses the callee frame.
         let p = self.e.pos();
         self.e.set_pos(p - f);
+        Ok(())
+    }
+
+    /// Function entry: fetch the parameters the caller staged in its scratch area
+    /// (one frame below), the hidden variadic pointer and, if this function or a
+    /// callee uses it, the memory stack pointer, all from the caller's frame.
+    pub(super) fn emit_prologue(&mut self) -> Result<()> {
+        let lay = self.lay.clone();
+        let f = lay.frame;
+        let fp = self.fp();
+        let func = self.func();
+        self.comment("prologue: fetch arguments");
+        let param_tys: Vec<TypeId> = func.params.iter().map(|&p| func.value_ty(p)).collect();
+        let offs = param_offsets(self.types(), &param_tys);
+        for (&p, &(off, size)) in func.params.iter().zip(&offs) {
+            let (cell, _) = self.define_slot(p)?;
+            for i in 0..size {
+                self.e
+                    .move_cell(lay.scratch + (off + i) as Cell - f, cell + i as Cell);
+            }
+        }
+        if let Some(s) = fp.va_slot {
+            // The variadic arguments were spilled at the caller's memory stack pointer.
+            let cell = self.slot_cell(&s);
+            self.clear_slot(cell, s.size);
+            for k in 0..s.size {
+                self.e.copy_cell(
+                    lay.msp + k as Cell - f,
+                    cell + k as Cell,
+                    cell + s.size as Cell,
+                );
+            }
+        }
+        if self.plan.needs_msp[fp.fid] {
+            for k in 0..self.ptr_limbs() {
+                self.e.clear(lay.msp + k as Cell);
+                self.e
+                    .copy_cell(lay.msp + k as Cell - f, lay.msp + k as Cell, lay.tmp);
+            }
+        }
         Ok(())
     }
 

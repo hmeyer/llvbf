@@ -2,9 +2,10 @@
 //! segments at calls and memory accesses, assigns frame slots to SSA values and
 //! lays out global variables in memory.
 
+use crate::arith::limbs;
 use crate::ir::*;
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What a memory access is for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +47,34 @@ pub enum Step {
     VaSetup(usize),
 }
 
+/// The shared arithmetic routines: multiplication, unsigned and signed division
+/// (each division routine yields both quotient and remainder).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArithKind {
+    Mul,
+    UDiv,
+    SDiv,
+}
+
+impl ArithKind {
+    pub fn of(op: BinOp) -> Option<ArithKind> {
+        match op {
+            BinOp::Mul => Some(ArithKind::Mul),
+            BinOp::UDiv | BinOp::URem => Some(ArithKind::UDiv),
+            BinOp::SDiv | BinOp::SRem => Some(ArithKind::SDiv),
+            _ => None,
+        }
+    }
+}
+
+/// A multiplication or division of `n`-limb operands serviced by a shared routine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArithOp {
+    pub instr: usize,
+    pub op: BinOp,
+    pub n: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SegEnd {
     /// The segment ends with the block terminator.
@@ -54,6 +83,8 @@ pub enum SegEnd {
     Call(usize),
     /// The segment ends with a memory access request.
     Access(Access),
+    /// The segment ends with a request to a shared arithmetic routine.
+    Arith(ArithOp),
 }
 
 #[derive(Clone, Debug)]
@@ -75,10 +106,18 @@ pub struct BlockPlan {
 pub enum SlotKind {
     /// Parameter area (layout determined by the signature).
     Param,
-    /// One slot per SSA value in the function's local area.
+    /// Shared pool for values that are defined and last used within one block;
+    /// slots are reused once a value is dead.
+    Pool,
+    /// Dedicated slot for values that live across blocks (and for phis).
     Local,
 }
 
+/// A slot holds the packed bytes of a value. Every slot is followed by a pad cell
+/// that is cleared when the value is defined and never written while it lives:
+/// copies out of the slot use it as their temporary, which makes a copy about as
+/// cheap as a move (the duplicate travels only one cell back instead of all the way
+/// from the destination).
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
     pub kind: SlotKind,
@@ -99,7 +138,18 @@ pub struct FuncPlan {
     pub extra_slots: HashMap<(usize, usize), Slot>,
     /// Slot of the hidden variadic-area pointer parameter (variadic functions only).
     pub va_slot: Option<Slot>,
+    /// Pooled values: the number of times each appears as an operand of a
+    /// non-terminator instruction of its block, and of the block's terminator
+    /// (including the phi copies of all outgoing edges). Used to move a value on
+    /// its last use instead of copying it.
+    pub instr_uses: HashMap<Value, usize>,
+    pub term_uses: HashMap<Value, usize>,
+    /// Per CFG edge, the cross-block values that may be moved (rather than copied)
+    /// into the phis of the successor: they are read by exactly one of its phis and
+    /// are not live in the successor.
+    pub edge_moves: HashMap<(BlockId, BlockId), Vec<Value>>,
     pub locals_size: usize,
+    pub pool_size: usize,
     pub params_size: usize,
     pub ret_size: usize,
 }
@@ -115,12 +165,21 @@ pub struct Plan {
     pub ret_max: usize,
     pub params_max: usize,
     pub locals_max: usize,
+    pub pool_max: usize,
     pub num_ids: usize,
     pub start_id: u16,
     pub exit_id: u16,
     /// Distinct (is_store, width) access kinds used by the program.
     pub access_kinds: Vec<(bool, usize)>,
+    /// Distinct (kind, limbs) arithmetic routines used by the program.
+    pub arith_kinds: Vec<(ArithKind, usize)>,
+    /// Size of the operand/result area of arithmetic requests (two operands).
+    pub arg_size: usize,
     pub mem_size: usize,
+    /// Functions (by `FuncId`) that use the memory stack pointer themselves or
+    /// through a callee: allocas, variadic calls, `va_arg`, indirect calls.
+    /// Calls to other functions skip copying MSP into the callee frame.
+    pub needs_msp: Vec<bool>,
 }
 
 impl Plan {
@@ -267,55 +326,122 @@ fn plan_function(
     fid: FuncId,
     next_id: &mut u16,
     access_kinds: &mut Vec<(bool, usize)>,
+    arith_kinds: &mut Vec<(ArithKind, usize)>,
 ) -> Result<FuncPlan> {
     let types = &m.types;
     let mut slots: HashMap<Value, Slot> = HashMap::new();
     // Parameters.
-    let mut poff = 0usize;
-    for &p in &f.params {
-        let size = types.size(f.value_ty(p));
+    let param_tys: Vec<TypeId> = f.params.iter().map(|&p| f.value_ty(p)).collect();
+    let offs = param_offsets(types, &param_tys);
+    for (&p, &(off, size)) in f.params.iter().zip(&offs) {
         slots.insert(
             p,
             Slot {
                 kind: SlotKind::Param,
-                off: poff,
+                off,
                 size,
             },
         );
-        poff += size;
     }
+    let mut poff = offs.last().map(|(o, s)| o + s + 1).unwrap_or(0);
     let va_slot = if f.variadic {
         let s = Slot {
             kind: SlotKind::Param,
             off: poff,
             size: types.ptr_bytes,
         };
-        poff += types.ptr_bytes;
+        poff += types.ptr_bytes + 1;
         Some(s)
     } else {
         None
     };
     let params_size = poff;
     let ret_size = types.size(f.ret);
-    // Locals: one slot per phi and per instruction result.
-    let mut loff = 0usize;
-    let mut extra_slots = HashMap::new();
-    let mut alloc_local = |size: usize| -> Slot {
-        let s = Slot {
-            kind: SlotKind::Local,
-            off: loff,
-            size,
-        };
-        loff += size;
-        s
-    };
+    // Where is each value used? A phi's incoming value counts as a use at the end of
+    // the predecessor block. Values whose uses all lie in their defining block are
+    // pooled; phis and cross-block values get dedicated slots.
+    let term_pos = |b: &Block| b.instrs.len();
+    let mut uses: HashMap<Value, Vec<(BlockId, usize)>> = HashMap::new();
+    let mut instr_uses: HashMap<Value, usize> = HashMap::new();
+    let mut term_uses: HashMap<Value, usize> = HashMap::new();
+    let mut def_block: HashMap<Value, BlockId> = HashMap::new();
     for (bi, bb) in f.blocks.iter().enumerate() {
         for phi in &bb.phis {
-            slots.insert(phi.dest, alloc_local(types.size(phi.ty)));
+            def_block.insert(phi.dest, usize::MAX); // never pooled
+            for (val, pred) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    uses.entry(v)
+                        .or_default()
+                        .push((*pred, term_pos(&f.blocks[*pred])));
+                    *term_uses.entry(v).or_default() += 1;
+                }
+            }
         }
         for (ii, inst) in bb.instrs.iter().enumerate() {
+            if let Some(d) = inst.dest {
+                def_block.insert(d, bi);
+            }
+            for v in op_values(&inst.op) {
+                uses.entry(v).or_default().push((bi, ii));
+                *instr_uses.entry(v).or_default() += 1;
+            }
+        }
+        for v in term_values(&bb.term) {
+            uses.entry(v).or_default().push((bi, term_pos(bb)));
+            *term_uses.entry(v).or_default() += 1;
+        }
+    }
+    // Instruction results fed into a phi are kept out of the pool so that they can
+    // share the phi's slot (see `allocate_cross_block`), which makes the phi copy a
+    // no-op.
+    let mut phi_feeders: HashSet<Value> = HashSet::new();
+    for bb in &f.blocks {
+        for phi in &bb.phis {
+            for (val, _) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    if matches!(def_block.get(&v), Some(&bi) if bi != usize::MAX) {
+                        phi_feeders.insert(v);
+                    }
+                }
+            }
+        }
+    }
+    let is_local = |v: Value| -> bool {
+        match def_block.get(&v) {
+            Some(&bi) if bi != usize::MAX && !phi_feeders.contains(&v) => uses
+                .get(&v)
+                .map(|u| u.iter().all(|(b, _)| *b == bi))
+                .unwrap_or(true),
+            _ => false,
+        }
+    };
+    // Slots. Block-local values are interval-allocated within a per-function pool
+    // (close to scratch). Phis and cross-block values are interval-allocated in the
+    // dedicated area using a liveness analysis over the CFG, so values that are never
+    // live at the same time share a slot.
+    let mut pool_size = 0usize;
+    let mut extra_slots = HashMap::new();
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        let mut pool = IntervalAllocator::default();
+        for (ii, inst) in bb.instrs.iter().enumerate() {
+            pool.release_dead(ii);
             if let Some(dest) = inst.dest {
-                slots.insert(dest, alloc_local(types.size(inst.ty)));
+                if is_local(dest) {
+                    let size = types.size(inst.ty);
+                    let end = uses
+                        .get(&dest)
+                        .and_then(|u| u.iter().map(|(_, p)| *p).max())
+                        .unwrap_or(ii);
+                    let off = pool.alloc(size + 1, end);
+                    slots.insert(
+                        dest,
+                        Slot {
+                            kind: SlotKind::Pool,
+                            off,
+                            size,
+                        },
+                    );
+                }
             }
             let needs_extra = match &inst.op {
                 Op::VaArg { .. } => true,
@@ -325,10 +451,28 @@ fn plan_function(
                 _ => false,
             };
             if needs_extra {
-                extra_slots.insert((bi, ii), alloc_local(types.ptr_bytes));
+                let off = pool.alloc(types.ptr_bytes + 1, ii);
+                extra_slots.insert(
+                    (bi, ii),
+                    Slot {
+                        kind: SlotKind::Pool,
+                        off,
+                        size: types.ptr_bytes,
+                    },
+                );
             }
         }
+        pool_size = pool_size.max(pool.top);
     }
+    let (loff, edge_moves) = allocate_cross_block(f, types, &uses, &is_local, &mut slots);
+    let instr_uses: HashMap<Value, usize> = instr_uses
+        .into_iter()
+        .filter(|(v, _)| is_local(*v))
+        .collect();
+    let term_uses: HashMap<Value, usize> = term_uses
+        .into_iter()
+        .filter(|(v, _)| is_local(*v))
+        .collect();
     // Blocks and segments.
     let mut block_ids = Vec::new();
     let mut blocks = Vec::new();
@@ -341,6 +485,7 @@ fn plan_function(
             prev_end: None,
             next_id,
             access_kinds,
+            arith_kinds,
         };
         for (i, inst) in bb.instrs.iter().enumerate() {
             match &inst.op {
@@ -351,6 +496,9 @@ fn plan_function(
                 Op::Store { value, align, .. } => {
                     let a = access_align(types, value.ty, *align);
                     sb.access(i, true, types.size(value.ty), a, 0, AccessRole::Plain);
+                }
+                Op::Binary { kind, a, b } if routed_arith(types, *kind, a, b) => {
+                    sb.arith(i, *kind, limbs(types.bits(a.ty)?));
                 }
                 Op::VaArg { .. } => {
                     sb.access(i, false, types.ptr_bytes, 2, 0, AccessRole::VaPtrLoad);
@@ -401,10 +549,379 @@ fn plan_function(
         slots,
         extra_slots,
         va_slot,
+        instr_uses,
+        term_uses,
+        edge_moves,
         locals_size: loff,
+        pool_size,
         params_size,
         ret_size,
     })
+}
+
+/// Offset and size of each parameter slot for the given parameter types.
+pub fn param_offsets(types: &TypeTable, tys: &[TypeId]) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    let mut off = 0;
+    for &t in tys {
+        let s = types.size(t);
+        v.push((off, s));
+        off += s + 1;
+    }
+    v
+}
+
+/// First-fit allocator of slots for values with known live intervals.
+#[derive(Default)]
+struct IntervalAllocator {
+    /// (end position, offset, size) of live intervals.
+    live: Vec<(usize, usize, usize)>,
+    /// (offset, size) of free ranges.
+    free: Vec<(usize, usize)>,
+    top: usize,
+}
+
+impl IntervalAllocator {
+    /// Free the slots of values whose last use is before instruction `pos`.
+    fn release_dead(&mut self, pos: usize) {
+        let (dead, live): (Vec<_>, Vec<_>) =
+            self.live.drain(..).partition(|(end, _, _)| *end < pos);
+        self.live = live;
+        for (_, off, size) in dead {
+            self.free.push((off, size));
+        }
+    }
+
+    fn alloc(&mut self, size: usize, end: usize) -> usize {
+        let off = if let Some(i) = self.free.iter().position(|(_, s)| *s == size) {
+            self.free.remove(i).0
+        } else if let Some(i) = self.free.iter().position(|(_, s)| *s > size) {
+            let (off, s) = self.free.remove(i);
+            self.free.push((off + size, s - size));
+            off
+        } else {
+            self.top += size;
+            self.top - size
+        };
+        self.live.push((end, off, size));
+        off
+    }
+}
+
+/// Allocate dedicated slots for phis and cross-block values (phi inputs included);
+/// returns the area size and the values each edge may move into the successor's phis.
+///
+/// Blocks are laid out in order to give every instruction a position (a block of
+/// `k` instructions occupies `k + 1` positions, the last one for its terminator).
+/// A liveness analysis over the CFG yields the values live on entry to and exit from
+/// each block. A value's interval spans from its definition to its last use, widened
+/// to cover every block it is live in and, for phis, the terminators of all
+/// predecessors (where phis are written). Two values live at the same program point
+/// then have overlapping intervals, so the first-fit allocator keeps them apart;
+/// everything else may share a slot.
+fn allocate_cross_block(
+    f: &Function,
+    types: &TypeTable,
+    uses: &HashMap<Value, Vec<(BlockId, usize)>>,
+    is_local: &dyn Fn(Value) -> bool,
+    slots: &mut HashMap<Value, Slot>,
+) -> (usize, HashMap<(BlockId, BlockId), Vec<Value>>) {
+    let nb = f.blocks.len();
+    let mut base = vec![0usize; nb];
+    let mut pos = 0;
+    for (b, bb) in f.blocks.iter().enumerate() {
+        base[b] = pos;
+        pos += bb.instrs.len() + 1;
+    }
+    let term_pos = |b: BlockId| base[b] + f.blocks[b].instrs.len();
+    let successors = |b: BlockId| -> Vec<BlockId> {
+        match &f.blocks[b].term {
+            Terminator::Br(d) => vec![*d],
+            Terminator::CondBr {
+                if_true, if_false, ..
+            } => vec![*if_true, *if_false],
+            Terminator::Switch { cases, default, .. } => {
+                let mut v: Vec<BlockId> = cases.iter().map(|(_, d)| *d).collect();
+                v.push(*default);
+                v
+            }
+            Terminator::Ret(_) | Terminator::Unreachable => vec![],
+        }
+    };
+    // Candidates (phis and non-local instruction results) and where they are defined.
+    let mut def_pos: HashMap<Value, usize> = HashMap::new();
+    for (b, bb) in f.blocks.iter().enumerate() {
+        for phi in &bb.phis {
+            def_pos.insert(phi.dest, base[b]);
+        }
+        for (i, inst) in bb.instrs.iter().enumerate() {
+            if let Some(d) = inst.dest {
+                if !is_local(d) {
+                    def_pos.insert(d, base[b] + i);
+                }
+            }
+        }
+    }
+    // Per block: candidates read before being defined (`upward`), candidates defined,
+    // and candidates read by the phis of successors (live at the end of this block).
+    let mut upward: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    let mut defined: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    let mut phi_out: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    for (b, bb) in f.blocks.iter().enumerate() {
+        for phi in &bb.phis {
+            defined[b].insert(phi.dest);
+            for (val, pred) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    if def_pos.contains_key(&v) {
+                        phi_out[*pred].insert(v);
+                    }
+                }
+            }
+        }
+        let read = |v: Value, defined: &HashSet<Value>, upward: &mut HashSet<Value>| {
+            if def_pos.contains_key(&v) && !defined.contains(&v) {
+                upward.insert(v);
+            }
+        };
+        for inst in &bb.instrs {
+            for v in op_values(&inst.op) {
+                read(v, &defined[b], &mut upward[b]);
+            }
+            if let Some(d) = inst.dest {
+                defined[b].insert(d);
+            }
+        }
+        for v in term_values(&bb.term) {
+            read(v, &defined[b], &mut upward[b]);
+        }
+    }
+    let mut live_in: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    let mut live_out: Vec<HashSet<Value>> = vec![HashSet::new(); nb];
+    loop {
+        let mut changed = false;
+        for b in (0..nb).rev() {
+            let mut out = phi_out[b].clone();
+            for s in successors(b) {
+                out.extend(live_in[s].iter().copied());
+            }
+            let mut inn = upward[b].clone();
+            inn.extend(out.iter().filter(|v| !defined[b].contains(v)));
+            if out != live_out[b] || inn != live_in[b] {
+                live_out[b] = out;
+                live_in[b] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut intervals: Vec<(usize, usize, Value)> = Vec::new();
+    for (&v, &def) in &def_pos {
+        let mut start = def;
+        let mut end = def;
+        for (b, p) in uses.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
+            end = end.max(base[*b] + p);
+        }
+        for b in 0..nb {
+            if live_in[b].contains(&v) {
+                start = start.min(base[b]);
+                end = end.max(base[b]);
+            }
+            if live_out[b].contains(&v) {
+                end = end.max(term_pos(b));
+            }
+        }
+        intervals.push((start, end, v));
+    }
+    for bb in &f.blocks {
+        for phi in &bb.phis {
+            let e = intervals
+                .iter_mut()
+                .find(|(_, _, v)| *v == phi.dest)
+                .unwrap();
+            for (_, pred) in &phi.incoming {
+                e.0 = e.0.min(term_pos(*pred));
+                e.1 = e.1.max(term_pos(*pred));
+            }
+        }
+    }
+    // A phi input that is not live in the successor dies on the edge: move it.
+    let mut edge_moves: HashMap<(BlockId, BlockId), Vec<Value>> = HashMap::new();
+    for (b, bb) in f.blocks.iter().enumerate() {
+        let mut reads: HashMap<(BlockId, Value), usize> = HashMap::new();
+        for phi in &bb.phis {
+            for (val, pred) in &phi.incoming {
+                if let Some(v) = val.as_value() {
+                    if def_pos.contains_key(&v) && !live_in[b].contains(&v) {
+                        *reads.entry((*pred, v)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        for ((pred, v), count) in reads {
+            if count == 1 {
+                edge_moves.entry((pred, b)).or_default().push(v);
+            }
+        }
+    }
+    // Coalescing: a phi and an incoming value whose intervals do not overlap (they
+    // may touch: the copy at the touching point then reads and writes the same slot)
+    // share one slot, which turns the phi copy into a no-op. Groups are built
+    // greedily; a group's interval is the hull of its members.
+    let mut group_of: HashMap<Value, usize> = HashMap::new();
+    let mut groups: Vec<(usize, usize, Vec<Value>)> = Vec::new();
+    let interval_of = |v: Value| -> (usize, usize) {
+        let e = intervals.iter().find(|(_, _, x)| *x == v).unwrap();
+        (e.0, e.1)
+    };
+    for &v in def_pos.keys() {
+        let (s, e) = interval_of(v);
+        group_of.insert(v, groups.len());
+        groups.push((s, e, vec![v]));
+    }
+    for bb in &f.blocks {
+        for phi in &bb.phis {
+            for (val, _) in &phi.incoming {
+                let Some(v) = val.as_value() else { continue };
+                if !def_pos.contains_key(&v) || types.size(f.value_ty(v)) != types.size(phi.ty) {
+                    continue;
+                }
+                let (gp, gv) = (group_of[&phi.dest], group_of[&v]);
+                if gp == gv {
+                    continue;
+                }
+                let (ps, pe, _) = groups[gp].clone();
+                let (vs, ve, _) = groups[gv].clone();
+                if ve <= ps || pe <= vs {
+                    // Merge gv into gp.
+                    let (_, _, members) = std::mem::take(&mut groups[gv]);
+                    for m in &members {
+                        group_of.insert(*m, gp);
+                    }
+                    groups[gp].0 = ps.min(vs);
+                    groups[gp].1 = pe.max(ve);
+                    groups[gp].2.extend(members);
+                }
+            }
+        }
+    }
+    // Placement: the most used groups get the lowest offsets (closest to the scratch
+    // area), each at the lowest offset not taken by an already placed group whose
+    // interval overlaps. Intervals that merely touch count as overlapping, as in the
+    // pool allocator.
+    let mut live_groups: Vec<(usize, usize, Vec<Value>)> =
+        groups.into_iter().filter(|g| !g.2.is_empty()).collect();
+    let weight = |members: &[Value]| -> usize {
+        members
+            .iter()
+            .map(|v| 1 + uses.get(v).map_or(0, |u| u.len()))
+            .sum()
+    };
+    live_groups.sort_by_key(|g| (std::cmp::Reverse(weight(&g.2)), g.0, g.1));
+    let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (off, len, start, end)
+    let mut top = 0;
+    for (start, end, members) in live_groups {
+        let size = types.size(f.value_ty(members[0]));
+        let len = size + 1;
+        let overlapping: Vec<(usize, usize)> = placed
+            .iter()
+            .filter(|p| !(end < p.2 || p.3 < start))
+            .map(|p| (p.0, p.1))
+            .collect();
+        let mut candidates: Vec<usize> = overlapping.iter().map(|(o, l)| o + l).collect();
+        candidates.push(0);
+        candidates.sort_unstable();
+        let off = candidates
+            .into_iter()
+            .find(|&c| overlapping.iter().all(|(o, l)| c + len <= *o || o + l <= c))
+            .unwrap();
+        placed.push((off, len, start, end));
+        top = top.max(off + len);
+        for v in members {
+            slots.insert(
+                v,
+                Slot {
+                    kind: SlotKind::Local,
+                    off,
+                    size,
+                },
+            );
+        }
+    }
+    (top, edge_moves)
+}
+
+/// The SSA values an instruction reads.
+pub fn op_values(op: &Op) -> Vec<Value> {
+    let mut v = Vec::new();
+    let mut add = |o: &Operand| {
+        if let Some(x) = o.as_value() {
+            v.push(x);
+        }
+    };
+    match op {
+        Op::Binary { a, b, .. } | Op::ICmp { a, b, .. } => {
+            add(a);
+            add(b);
+        }
+        Op::Cast { x, .. } | Op::Freeze { x } => add(x),
+        Op::Load { addr, .. } => add(addr),
+        Op::Store { addr, value, .. } => {
+            add(addr);
+            add(value);
+        }
+        Op::Gep { base, indices, .. } => {
+            add(base);
+            indices.iter().for_each(&mut add);
+        }
+        Op::Call { callee, args, .. } => {
+            if let Callee::Indirect(c) = callee {
+                add(c);
+            }
+            args.iter().for_each(&mut add);
+        }
+        Op::Alloca { .. } => {}
+        Op::Select {
+            cond,
+            if_true,
+            if_false,
+        } => {
+            add(cond);
+            add(if_true);
+            add(if_false);
+        }
+        Op::ExtractValue { agg, .. } => add(agg),
+        Op::InsertValue { agg, elem, .. } => {
+            add(agg);
+            add(elem);
+        }
+        Op::VaArg { list } => add(list),
+    }
+    v
+}
+
+/// The SSA values a terminator reads (phi incomings are counted separately).
+pub fn term_values(t: &Terminator) -> Vec<Value> {
+    match t {
+        Terminator::Ret(Some(op))
+        | Terminator::CondBr { cond: op, .. }
+        | Terminator::Switch { value: op, .. } => op.as_value().into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Multiplications by a variable and all divisions go through the shared routines;
+/// they are far too big to inline. Odd bit widths are kept inline (the routines
+/// work on whole limbs).
+fn routed_arith(types: &TypeTable, op: BinOp, a: &Operand, b: &Operand) -> bool {
+    let Some(kind) = ArithKind::of(op) else {
+        return false;
+    };
+    let Ok(bits) = types.bits(a.ty) else {
+        return false;
+    };
+    bits % 8 == 0 && bits <= 64 && (kind != ArithKind::Mul || b.as_const().is_none())
 }
 
 /// Accumulates the segments of one basic block.
@@ -414,6 +931,7 @@ struct SegBuilder<'a> {
     prev_end: Option<SegEnd>,
     next_id: &'a mut u16,
     access_kinds: &'a mut Vec<(bool, usize)>,
+    arith_kinds: &'a mut Vec<(ArithKind, usize)>,
 }
 
 impl<'a> SegBuilder<'a> {
@@ -427,6 +945,15 @@ impl<'a> SegBuilder<'a> {
         });
         *self.next_id = self.next_id.checked_add(1).expect("too many blocks");
         self.prev_end = Some(end);
+    }
+
+    /// Close the segment with an arithmetic routine request.
+    fn arith(&mut self, instr: usize, op: BinOp, n: usize) {
+        let kind = ArithKind::of(op).expect("arithmetic routine kind");
+        if !self.arith_kinds.contains(&(kind, n)) {
+            self.arith_kinds.push((kind, n));
+        }
+        self.finish(SegEnd::Arith(ArithOp { instr, op, n }));
     }
 
     /// Close one segment per aligned chunk of a memory access.
@@ -532,11 +1059,12 @@ pub fn plan_module(m: &Module, mem_size: usize, entry: &str) -> Result<Plan> {
     let mut funcs = Vec::new();
     let mut func_plan = HashMap::new();
     let mut access_kinds = Vec::new();
+    let mut arith_kinds = Vec::new();
     for (fid, f) in m.functions.iter().enumerate() {
         if f.is_declaration() {
             continue;
         }
-        let fp = plan_function(m, f, fid, &mut next_id, &mut access_kinds)
+        let fp = plan_function(m, f, fid, &mut next_id, &mut access_kinds, &mut arith_kinds)
             .with_context(|| format!("in function {}", f.name))?;
         func_plan.insert(fid, funcs.len());
         funcs.push(fp);
@@ -595,9 +1123,11 @@ pub fn plan_module(m: &Module, mem_size: usize, entry: &str) -> Result<Plan> {
             }
         }
     }
+    let needs_msp = compute_needs_msp(m);
     let ret_max = funcs.iter().map(|f| f.ret_size).max().unwrap_or(0).max(2);
     let params_max = funcs.iter().map(|f| f.params_size).max().unwrap_or(0);
     let locals_max = funcs.iter().map(|f| f.locals_size).max().unwrap_or(0);
+    let pool_max = funcs.iter().map(|f| f.pool_size).max().unwrap_or(0);
     Ok(Plan {
         funcs,
         func_plan,
@@ -607,10 +1137,64 @@ pub fn plan_module(m: &Module, mem_size: usize, entry: &str) -> Result<Plan> {
         ret_max,
         params_max,
         locals_max,
+        pool_max,
         num_ids: next_id as usize,
         start_id,
         exit_id,
         access_kinds,
+        arg_size: 2 * arith_kinds.iter().map(|k| k.1).max().unwrap_or(0),
+        arith_kinds,
         mem_size,
+        needs_msp,
     })
+}
+
+/// Which functions need a valid memory stack pointer in their frame (see `Plan::needs_msp`).
+fn compute_needs_msp(m: &Module) -> Vec<bool> {
+    let n = m.functions.len();
+    let mut needs = vec![false; n];
+    let mut callees: Vec<Vec<FuncId>> = vec![Vec::new(); n];
+    for (fid, f) in m.functions.iter().enumerate() {
+        for bb in &f.blocks {
+            for inst in &bb.instrs {
+                match &inst.op {
+                    Op::Alloca { .. } | Op::VaArg { .. } => needs[fid] = true,
+                    Op::Call { callee, fn_ty, .. } => {
+                        if call_is_variadic(&m.types, *fn_ty) {
+                            needs[fid] = true;
+                        }
+                        match callee {
+                            Callee::Direct(c) => callees[fid].push(*c),
+                            Callee::Indirect(_) => needs[fid] = true,
+                            Callee::Intrinsic(name) => {
+                                if name.starts_with("llvm.va_") {
+                                    needs[fid] = true;
+                                }
+                                if let Some(rt) = intrinsic_runtime_call(name) {
+                                    if let Some(c) = m.func_by_name(rt) {
+                                        callees[fid].push(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Propagate to callers until stable.
+    loop {
+        let mut changed = false;
+        for fid in 0..n {
+            if !needs[fid] && callees[fid].iter().any(|&c| needs[c]) {
+                needs[fid] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    needs
 }

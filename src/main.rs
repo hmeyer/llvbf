@@ -8,7 +8,8 @@ fn usage() -> ! {
   llvbf cc <sources.c...> [-o out.bf] [--run] [--target TRIPLE] [-O0|-O1|-O2|-O3|-Os|-Oz]
            [--mem-size N] [--comments] [--entry NAME] [--runtime DIR] [--no-runtime]
            [--keep-ir out.ll] [--llvm-bin DIR] [-I dir] [-D macro] [-Xclang ARG]
-  llvbf run <program.bf> [--max-steps N] [--stats] [--profile]"
+  llvbf run <program.bf> [--max-steps N] [--stats] [--profile]
+  llvbf size <program.bf>      (bytes per construct; needs a --comments build)"
     );
     std::process::exit(2);
 }
@@ -142,6 +143,11 @@ fn real_main() -> Result<()> {
                 use std::io::Write;
                 std::io::stdout().write_all(&code)?;
             }
+        }
+        "size" => {
+            let src = std::fs::read_to_string(&args[2])
+                .with_context(|| format!("reading {}", args[2]))?;
+            llvbf::size_report(&src);
         }
         "run" => {
             let src = std::fs::read_to_string(&args[2])

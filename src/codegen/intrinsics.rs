@@ -114,10 +114,7 @@ impl<'a> Gen<'a> {
     }
 
     fn getc(&mut self, dest: Value) -> Result<()> {
-        let (cell, size) = self.slot(dest)?;
-        for k in 0..size {
-            self.e.clear(cell + k as Cell);
-        }
+        let (cell, _) = self.define_slot(dest)?;
         // The cell is zero, so an interpreter that leaves it unchanged at EOF yields 0.
         self.e.input(cell);
         Ok(())
@@ -149,35 +146,47 @@ impl<'a> Gen<'a> {
     ) -> Result<()> {
         let n = limbs(self.op_bits(a)?);
         let m = self.sc.mark();
-        let wa = Work::alloc(&mut self.sc, n);
+        // d = a - b with an extra limb that becomes 255 when a < b (unsigned order,
+        // signed operands mapped onto it by flipping the sign bits); the operands are
+        // then recovered from d and b, so no copies are needed.
+        let wd = Work::alloc(&mut self.sc, n + 1);
         let wb = Work::alloc(&mut self.sc, n);
-        self.load_operand(a, wa)?;
+        self.load_operand(a, wd.truncated(n))?;
         self.load_operand(b, wb)?;
         if signed {
-            flip_sign(&mut self.e, wa);
+            flip_sign(&mut self.e, wd.truncated(n));
             flip_sign(&mut self.e, wb);
         }
-        let lt = Work::alloc(&mut self.sc, 1); // a < b
-        ult(&mut self.e, &mut self.sc, wa, wb, lt.limb(0));
-        if signed {
-            flip_sign(&mut self.e, wa);
-            flip_sign(&mut self.e, wb);
-        }
-        // Pick the operand: if a < b the maximum is b, otherwise a (and vice versa for min).
-        let res = Work::alloc(&mut self.sc, n);
+        sub_work_keep(&mut self.e, wd, wb);
+        let lt = wd.limb(n);
         let flag = self.sc.alloc(1);
-        self.e.begin_if_else(lt.limb(0), flag);
-        // a >= b
-        let (keep, drop) = if want_max { (wa, wb) } else { (wb, wa) };
-        move_work(&mut self.e, keep, res);
-        clear_work(&mut self.e, drop);
-        self.e.else_if_else(lt.limb(0), flag);
+        let res = Work::alloc(&mut self.sc, n);
+        self.e.begin_if_else(lt, flag);
+        // a >= b: a = d + b
+        if want_max {
+            add_work_keep(&mut self.e, wd, wb);
+            move_work(&mut self.e, wd.truncated(n), res);
+            clear_work(&mut self.e, wb);
+        } else {
+            move_work(&mut self.e, wb, res);
+            clear_work(&mut self.e, wd.truncated(n));
+        }
+        self.e.else_if_else(lt, flag);
         // a < b
-        let (keep, drop) = if want_max { (wb, wa) } else { (wa, wb) };
-        move_work(&mut self.e, keep, res);
-        clear_work(&mut self.e, drop);
+        self.e.clear(lt);
+        if want_max {
+            move_work(&mut self.e, wb, res);
+            clear_work(&mut self.e, wd.truncated(n));
+        } else {
+            add_work_keep(&mut self.e, wd, wb);
+            self.e.clear(lt); // the carry back into the top limb
+            move_work(&mut self.e, wd.truncated(n), res);
+            clear_work(&mut self.e, wb);
+        }
         self.e.end_if_else(flag);
-        self.e.clear(lt.limb(0));
+        if signed {
+            flip_sign(&mut self.e, res);
+        }
         self.store_result(dest, res)?;
         self.sc.release(m);
         Ok(())
@@ -324,11 +333,8 @@ impl<'a> Gen<'a> {
     fn with_overflow(&mut self, inst: &Instr, args: &[&Operand], name: &str) -> Result<()> {
         let dest = inst.dest.unwrap();
         let n = limbs(self.op_bits(args[0])?);
-        let (cell, size) = self.slot(dest)?;
+        let (cell, _) = self.define_slot(dest)?;
         let (_, flag_off) = self.types().element(inst.ty, 1)?;
-        for k in 0..size {
-            self.e.clear(cell + k as Cell);
-        }
         let m = self.sc.mark();
         let ovf = self.sc.alloc(1);
         if name.starts_with("llvm.uadd.") {

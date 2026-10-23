@@ -60,12 +60,13 @@ The driver looks for `clang`, `llvm-link` and `opt` in `--llvm-bin`, `LLVBF_LLVM
 ## Usage
 
 ```
-llvbf cc <sources.c...> -o out.bf [--run] [-Os|-O1|...] [--mem-size N] [--comments] [--keep-ir out.ll]
+llvbf cc <sources.c...> -o out.bf [--run] [-Oz|-Os|-O2|...] [--mem-size N] [--comments] [--keep-ir out.ll]
 llvbf compile <input.ll|input.bc> -o out.bf [--mem-size N] [--comments] [--entry NAME]
-llvbf run <program.bf> [--stats]
+llvbf run <program.bf> [--stats] [--profile]
+llvbf size <program.bf>
 ```
 
-`llvbf cc` runs `clang -target riscv32-unknown-elf -Os -ffreestanding` on each source and on the
+`llvbf cc` runs `clang -target riscv32-unknown-elf -Oz -ffreestanding` on each source and on the
 runtime in `runtime/`, links everything with `llvm-link`, runs `opt` (internalize + O2 with
 clang's size attributes + dead code elimination) and lowers the result. `--target msp430` selects
 the **16-bit mode**: `int` and pointers are 16 bits, which halves the arithmetic and makes the
@@ -76,6 +77,8 @@ the output with the IR it came from, which is the main debugging aid.
 
 `llvbf run` is an optimizing interpreter: it executes `[-]`, balanced multiply/move loops and
 scan loops in constant time. The generated code relies on this heavily (see Performance).
+`llvbf size` reports, for a `--comments` build, how many bytes of output each kind of construct
+and each shared routine accounts for.
 
 ## How it works
 
@@ -120,13 +123,27 @@ Every **frame** has the same size `F` and the same layout:
 
 | cells | purpose |
 |---|---|
+| `RET`, params | return value and parameters (laid out by signature) |
 | `ACTIVE` | 1 while the frame is live. It is the cell the main loop tests, and the marker the memory routine uses to find the bottom of the stack. |
 | `HOME`, `NOTHOME` | mark the frame that issued a memory request |
 | `PC_LO/HI`, `CH_LO/HI` | the block id to execute next, and its working copy for the dispatch chain |
-| `REQ[k]`, `ADDR_LO/HI`, `HOPS`, `CNT`, `T`, `DATA[0..8]` | the memory request: kind flags, address, and the bytes being transferred (also the "walking block", see below) |
+| `REQ[k]`, `ADDR_LO/HI`, `HOPS`, `CNT`, `T`, `DATA[0..8]` | the memory and arithmetic requests: kind flags, address, and the bytes being transferred (also the "walking block", see below) |
 | `MSP` | memory stack pointer (a hidden, per-frame copy) |
-| scratch | zero cells used by arithmetic routines; sized by a measuring pass |
-| `RET`, params, locals | return value, parameters (laid out by signature), one packed slot per SSA value |
+| pool | slots of values used only inside their defining block, shared by live range |
+| `ARG` | operands and results of requests to the shared multiplication/division routines |
+| scratch | zero cells used by the inline arithmetic; sized by a measuring pass. Between segments it stages the arguments of a call. |
+| locals | slots of values that live across blocks (phis included), shared by liveness |
+
+The header sits in the middle of the frame because every segment starts and ends in it and the
+request cells are written from the slots next to it. Every slot is a packed little-endian value
+followed by one pad cell, cleared when the value is defined: a copy out of the slot uses the pad as
+its temporary, so the duplicate travels one cell instead of all the way back from the
+destination and a copy costs about as much as a move. A value is moved rather than copied on its
+last use. Slots are assigned by interval allocation: block-local values within their block (the
+pool), the others from a liveness analysis over the CFG, with the most used values closest to the
+scratch area. A phi shares its slot with an incoming value whose live range does not overlap it,
+which makes most loop-carried phi copies vanish. Since output size is almost entirely head
+movement, these placement choices are what the size of the output depends on.
 
 All code is **position independent**: the emitter only tracks offsets relative to the current
 frame base. A call therefore shifts the whole coordinate system by `F` and costs no tape movement
@@ -161,17 +178,21 @@ and return sequences therefore prepare those two cells in the destination frame
 
 ### Calls, returns, varargs
 
-A call copies the arguments into the callee frame's parameter area, copies `MSP`, sets the callee's
-`ACTIVE` and `PC` (the callee's entry id — a function pointer *is* its entry segment id), sets its
-own `PC` to the continuation, and shifts. `ret` writes the value into its own `RET` area, clears
-`ACTIVE` and shifts back; the caller's continuation segment moves `RET` of the frame above into the
-destination slot. Recursion needs nothing special. A synthetic start frame calls the entry function
-and clears its `ACTIVE` when it returns, which ends the main loop.
+A call stages the arguments in its own scratch area (laid out like the callee's parameter slots),
+sets the callee's `ACTIVE` and `PC` (the callee's entry id — a function pointer *is* its entry
+segment id), sets its own `PC` to the continuation, and shifts. The callee's prologue moves the
+arguments from the frame below into its parameter slots and copies `MSP` if the function (or
+something it calls) uses it; the long moves across the frame boundary are thus emitted once per
+function rather than once per call site. `ret` writes the value into its own `RET` area, clears
+`ACTIVE` and shifts back; the caller's continuation segment moves `RET` of the frame above into
+the destination slot. Recursion needs nothing special. A synthetic start frame calls the entry
+function and clears its `ACTIVE` when it returns, which ends the main loop.
 
 Variadic arguments are spilled by the caller into the memory stack in pointer-sized slots (aligned
 to at most two pointers, which is what clang's inline `va_arg` expansion assumes on 32-bit
-targets) and a hidden pointer parameter is passed. `va_start` stores it; on the 16-bit target,
-where clang emits the `va_arg` instruction, llvbf lowers it to three ordinary memory accesses.
+targets); the callee's prologue takes the caller's `MSP` as the hidden pointer to them. `va_start`
+stores it; on the 16-bit target, where clang emits the `va_arg` instruction, llvbf lowers it to
+three ordinary memory accesses.
 
 ### Memory accesses
 
@@ -198,6 +219,13 @@ multiplication is shift-and-add; division is restoring long division; signed ope
 unsigned ones by flipping sign bits; bitwise operations decompose limbs into bits. Everything is
 unit-tested against native arithmetic (`cargo test`).
 
+Multiplications by a variable and all divisions are not emitted inline: like memory accesses they
+are requests to a shared routine per (operation, width), issued through the `ARG` cells and
+serviced at the end of the dispatch iteration. The routine works in the free tape above the
+active frame, so the frame's scratch area only has to fit the inline operations. Multiplication by
+a constant is Horner's scheme over the constant's non-adjacent form (`x * -10` is two
+subtractions), and shifts by `k` bits take one pass per limb.
+
 ## Rust (and other frontends)
 
 Any LLVM frontend works if it can target 32-bit (or 16-bit) pointers and emit a module with no
@@ -209,30 +237,35 @@ installed and skips it otherwise.
 
 ## Performance
 
-Numbers for the examples, compiled with `-Os` and run with `llvbf run`, for the default 32-bit
-target and the 16-bit mode:
+Numbers for the examples, compiled with the default `-Oz` and run with `llvbf run`, for the
+default 32-bit target and the 16-bit mode:
 
 | program | riscv32 size / ops | msp430 size / ops |
 |---|---|---|
-| fib(0..15), recursive, printf | 12.4 MB / 51 M | 6.1 MB / 47 M |
-| bubble sort | 12.4 MB / 7 M | 6.1 MB / 6 M |
-| strings | 13.7 MB / 15 M | 6.7 MB / 14 M |
-| sieve to 200 | 12.5 MB / 41 M | 6.1 MB / 36 M |
+| fib(0..15), recursive, printf | 0.80 MB / 55 M | 0.49 MB / 57 M |
+| bubble sort | 0.86 MB / 7.6 M | 0.50 MB / 6.9 M |
+| strings | 1.04 MB / 17 M | 0.58 MB / 16 M |
+| sieve to 200 | 0.81 MB / 42 M | 0.52 MB / 39 M |
 
-Almost all of the size is head movement (`>>>…`) between frame slots and scratch, because every
-SSA value has its own slot and frames are several hundred cells wide. Time goes to the carry
-loops of multi-limb arithmetic, the memory routines and the dispatch chain; the 32-bit target
-doubles the limb count but only costs 1.2–1.6x in executed operations.
+Almost all of the size is head movement (`>>>…`) between frame slots and scratch, so the size
+of a program is governed by the frame width and by how far each operand sits from the scratch
+area; the slot assignment described above exists to keep both small. Most of the remaining size
+is the C runtime (`printf` above all), which is why `-Oz` is the default: `-Os` costs about 40%
+more output for 9% fewer executed operations, `-O2` about 60% more. `llvbf size` on a
+`--comments` build attributes the bytes to constructs and routines. Time goes to the carry loops
+of multi-limb arithmetic, the memory routines and the dispatch chain; the 32-bit target doubles the
+limb count but only costs 1.2–1.6x in executed operations.
 
 `llvbf run --profile` on a program compiled with `--comments` attributes executed operations to
 the IR instructions and routines they came from, which is how to find out where a program's time
 goes. The arithmetic routines are designed around one observation: in Brainfuck, a loop costs one
 pass per unit of the cell it counts down, so every routine should count down the smallest value it
 can. Constants are added or subtracted in whichever form has the smaller limb sum (`x + 0xFFFFFFFF`
-runs as `x - 1`), multiplication extracts the multiplier's bits once and shifts the multiplicand
-only seven times, and division extracts the dividend's bits once, shifts only the remainder and
-skips leading zeros, so the cost of `/` and `%` tracks the size of the values rather than the width
-of the type.
+runs as `x - 1`), multiplication extracts the multiplier's bits limb by limb and shifts the
+multiplicand only seven times, and division extracts the dividend's bits limb by limb, shifts only
+the remainder and skips leading zeros, so the cost of `/` and `%` tracks the size of the values
+rather than the width of the type. The routines loop over limbs at run time and unroll only the
+eight steps within a limb, which keeps them small without adding operations.
 
 The code assumes an interpreter that runs balanced loops such as `[->>>+<<<]` in constant time.
 On a naive interpreter every copy costs time proportional to the value times the distance, and

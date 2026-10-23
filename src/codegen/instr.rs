@@ -158,50 +158,46 @@ impl<'a> Gen<'a> {
         let bits = self.op_bits(a)?;
         let n = limbs(bits);
         let m = self.sc.mark();
-        let wa = Work::alloc(&mut self.sc, n);
+        // `a` gets an extra limb so that the borrow of a - b lands in it.
+        let wa = Work::alloc(&mut self.sc, n + 1);
         let wb = Work::alloc(&mut self.sc, n);
-        self.load_operand(a, wa)?;
-        self.load_operand(b, wb)?;
-        let flag = Work::alloc(&mut self.sc, 1);
-        let fc = flag.limb(0);
+        // Every predicate is `eq` or an unsigned `<`, possibly with operands swapped
+        // and/or the result negated.
+        let (swap, negate, is_eq) = match pred {
+            Pred::Eq => (false, false, true),
+            Pred::Ne => (false, true, true),
+            Pred::Ult | Pred::Slt => (false, false, false),
+            Pred::Ugt | Pred::Sgt => (true, false, false),
+            Pred::Ule | Pred::Sle => (true, true, false),
+            Pred::Uge | Pred::Sge => (false, true, false),
+        };
+        let (first, second) = if swap { (b, a) } else { (a, b) };
+        self.load_operand(first, wa.truncated(n))?;
+        self.load_operand(second, wb)?;
         if pred.is_signed() {
             if bits % 8 != 0 {
                 // Sign bit of a sub-byte value (i1): move it to the top of the limb.
                 let k = 8 - (bits % 8);
-                shl_const(&mut self.e, &mut self.sc, wa, k);
+                shl_const(&mut self.e, &mut self.sc, wa.truncated(n), k);
                 shl_const(&mut self.e, &mut self.sc, wb, k);
             }
-            flip_sign(&mut self.e, wa);
+            flip_sign(&mut self.e, wa.truncated(n));
             flip_sign(&mut self.e, wb);
         }
-        // Everything is expressed with `eq` and unsigned `<`; the negated forms
-        // compute the opposite predicate into `t` and take 1 - t.
-        let negate = |this: &mut Self, t: Cell| {
-            this.e.inc(fc);
-            this.e.move_cell_neg(t, fc);
-        };
-        match pred {
-            Pred::Eq => eq(&mut self.e, &mut self.sc, wa, wb, fc),
-            Pred::Ne => {
-                let t = self.sc.alloc(1);
-                eq(&mut self.e, &mut self.sc, wa, wb, t);
-                negate(self, t);
-            }
-            Pred::Ult | Pred::Slt => ult(&mut self.e, &mut self.sc, wa, wb, fc),
-            Pred::Ugt | Pred::Sgt => ult(&mut self.e, &mut self.sc, wb, wa, fc),
-            Pred::Ule | Pred::Sle => {
-                let t = self.sc.alloc(1);
-                ult(&mut self.e, &mut self.sc, wb, wa, t);
-                negate(self, t);
-            }
-            Pred::Uge | Pred::Sge => {
-                let t = self.sc.alloc(1);
-                ult(&mut self.e, &mut self.sc, wa, wb, t);
-                negate(self, t);
-            }
+        let flag = Work::alloc(&mut self.sc, 1);
+        let fc = flag.limb(0);
+        if is_eq {
+            sub_work(&mut self.e, wa.truncated(n), wb);
+            is_zero_destructive(&mut self.e, wa.truncated(n), fc);
+        } else {
+            ult_destructive(&mut self.e, wa, wb, fc);
         }
-        clear_work(&mut self.e, wa);
-        clear_work(&mut self.e, wb);
+        if negate {
+            let t = self.sc.alloc(1);
+            self.e.move_cell(fc, t);
+            self.e.inc(fc);
+            self.e.move_cell_neg(t, fc);
+        }
         self.store_result(dest, flag)?;
         self.sc.release(m);
         Ok(())

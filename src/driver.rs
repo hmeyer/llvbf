@@ -25,7 +25,7 @@ impl Default for CcOptions {
             sources: vec![],
             output: None,
             target: DEFAULT_TARGET.to_string(),
-            opt_level: "-Os".to_string(),
+            opt_level: "-Oz".to_string(),
             extra_clang_args: vec![],
             runtime_dir: None,
             no_runtime: false,
