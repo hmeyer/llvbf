@@ -1,0 +1,6 @@
+brainfuck  -> kcufniarb (9 chars)
+llvm       -> mvll (4 chars)
+backend    -> dnekcab (7 chars)
+[KCUFNIARB MVLL DNEKCAB ]
+cmp: 1 0 1
+o world

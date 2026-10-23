@@ -82,9 +82,7 @@ impl Program {
                     ops.push(Op::LoopStart(0));
                 }
                 b']' => {
-                    let start = depth_stack
-                        .pop()
-                        .ok_or_else(|| anyhow!("unmatched ']'"))?;
+                    let start = depth_stack.pop().ok_or_else(|| anyhow!("unmatched ']'"))?;
                     // Try to recognize optimizable loop shapes.
                     let body = &ops[start + 1..];
                     if let Some(opt) = optimize_loop(body) {
@@ -114,7 +112,11 @@ impl Program {
     }
 
     /// Run the program and return output and the final tape (for tests and debugging).
-    pub fn run_with_tape(&self, input: &[u8], max_steps: Option<u64>) -> Result<(Vec<u8>, Vec<u8>, Stats)> {
+    pub fn run_with_tape(
+        &self,
+        input: &[u8],
+        max_steps: Option<u64>,
+    ) -> Result<(Vec<u8>, Vec<u8>, Stats)> {
         let mut out = Vec::new();
         let mut inp = input;
         let mut tape: Vec<u8> = vec![0; 1 << 16];
@@ -123,7 +125,12 @@ impl Program {
     }
 
     /// Run the program against arbitrary reader / writer.
-    pub fn run(&self, input: &mut dyn Read, output: &mut dyn Write, max_steps: Option<u64>) -> Result<Stats> {
+    pub fn run(
+        &self,
+        input: &mut dyn Read,
+        output: &mut dyn Write,
+        max_steps: Option<u64>,
+    ) -> Result<Stats> {
         let mut tape: Vec<u8> = vec![0; 1 << 16];
         self.run_on_tape(input, output, max_steps, &mut tape)
     }
@@ -266,11 +273,18 @@ fn optimize_loop(body: &[Op]) -> Option<Op> {
     if off != 0 {
         return None;
     }
-    let loop_delta = deltas.iter().find(|(o, _)| *o == 0).map(|e| e.1).unwrap_or(0);
+    let loop_delta = deltas
+        .iter()
+        .find(|(o, _)| *o == 0)
+        .map(|e| e.1)
+        .unwrap_or(0);
     if loop_delta != 255 {
         return None;
     }
-    let terms: Vec<(isize, u8)> = deltas.into_iter().filter(|(o, f)| *o != 0 && *f != 0).collect();
+    let terms: Vec<(isize, u8)> = deltas
+        .into_iter()
+        .filter(|(o, f)| *o != 0 && *f != 0)
+        .collect();
     if terms.is_empty() {
         Some(Op::Clear)
     } else {
@@ -304,7 +318,8 @@ mod tests {
     #[test]
     fn muladd_loop() {
         // 3 * 5 via multiply loop, then print as char + 'A'
-        let src = "+++[->+++++<]>+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.";
+        let src =
+            "+++[->+++++<]>+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.";
         assert_eq!(run_str(src, b"").unwrap(), b"P");
     }
 

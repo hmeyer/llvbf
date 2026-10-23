@@ -46,13 +46,19 @@ impl Walker {
             return;
         }
         // Recurse into operands of constant aggregates and expressions.
-        if !LLVMIsAConstantExpr(v).is_null() || !LLVMIsAConstantStruct(v).is_null() || !LLVMIsAConstantArray(v).is_null() || !LLVMIsAConstantVector(v).is_null() {
+        if !LLVMIsAConstantExpr(v).is_null()
+            || !LLVMIsAConstantStruct(v).is_null()
+            || !LLVMIsAConstantArray(v).is_null()
+            || !LLVMIsAConstantVector(v).is_null()
+        {
             let n = LLVMGetNumOperands(v);
             for i in 0..n {
                 self.visit_value(LLVMGetOperand(v, i as u32));
             }
         }
-        if !LLVMIsAConstantExpr(v).is_null() && LLVMGetConstOpcode(v) == LLVMOpcode::LLVMGetElementPtr {
+        if !LLVMIsAConstantExpr(v).is_null()
+            && LLVMGetConstOpcode(v) == LLVMOpcode::LLVMGetElementPtr
+        {
             self.visit_gep(v);
         }
     }
@@ -64,7 +70,10 @@ impl Walker {
         }
         let base = LLVMGetOperand(gep, 0);
         if LLVMIsAGlobalValue(base).is_null() {
-            self.conflicts.push(format!("constant GEP with non-global base: {}", print_value(gep)));
+            self.conflicts.push(format!(
+                "constant GEP with non-global base: {}",
+                print_value(gep)
+            ));
             return;
         }
         let base_name = value_name(base);
@@ -72,7 +81,10 @@ impl Walker {
         for i in 1..n {
             let op = LLVMGetOperand(gep, i);
             if LLVMIsAConstantInt(op).is_null() {
-                self.conflicts.push(format!("constant GEP with non-integer index: {}", print_value(gep)));
+                self.conflicts.push(format!(
+                    "constant GEP with non-integer index: {}",
+                    print_value(gep)
+                ));
                 return;
             }
             indices.push(LLVMConstIntGetSExtValue(op));
@@ -90,7 +102,10 @@ impl Walker {
                     off += idx * LLVMABISizeOfType(self.td, ty) as i64;
                 }
                 _ => {
-                    self.conflicts.push(format!("constant GEP indexes into non-aggregate: {}", print_value(gep)));
+                    self.conflicts.push(format!(
+                        "constant GEP indexes into non-aggregate: {}",
+                        print_value(gep)
+                    ));
                     return;
                 }
             }
@@ -156,7 +171,12 @@ pub fn load_gep_table(path: &Path) -> Result<GepTable> {
             }
         }
         let td = LLVMGetModuleDataLayout(module);
-        let mut w = Walker { td, seen: HashSet::new(), table: GepTable::default(), conflicts: Vec::new() };
+        let mut w = Walker {
+            td,
+            seen: HashSet::new(),
+            table: GepTable::default(),
+            conflicts: Vec::new(),
+        };
         let mut g = LLVMGetFirstGlobal(module);
         while !g.is_null() {
             let init = LLVMGetInitializer(g);
@@ -184,7 +204,10 @@ pub fn load_gep_table(path: &Path) -> Result<GepTable> {
         LLVMDisposeModule(module);
         LLVMContextDispose(ctx);
         if !w.conflicts.is_empty() {
-            return Err(anyhow!("unsupported constant expressions:\n  {}", w.conflicts.join("\n  ")));
+            return Err(anyhow!(
+                "unsupported constant expressions:\n  {}",
+                w.conflicts.join("\n  ")
+            ));
         }
         Ok(w.table)
     }

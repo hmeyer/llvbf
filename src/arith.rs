@@ -21,7 +21,11 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(start: Cell) -> Self {
-        Scratch { start, next: start, high_water: start }
+        Scratch {
+            start,
+            next: start,
+            high_water: start,
+        }
     }
     pub fn alloc(&mut self, n: usize) -> Cell {
         let c = self.next;
@@ -59,7 +63,10 @@ impl Work {
         self.base + 3 * i as Cell
     }
     pub fn alloc(sc: &mut Scratch, n: usize) -> Work {
-        Work { base: sc.alloc(3 * n), n }
+        Work {
+            base: sc.alloc(3 * n),
+            n,
+        }
     }
     /// View the first `n` limbs as a smaller work area.
     pub fn truncated(&self, n: usize) -> Work {
@@ -292,7 +299,10 @@ pub fn flip_sign(e: &mut Emitter, w: Work) {
 /// Non-destructively compute the sign bit (top bit) of `w` into `flag` (zero).
 pub fn sign_bit(e: &mut Emitter, sc: &mut Scratch, w: Work, flag: Cell) {
     let m = sc.mark();
-    let top = Work { base: w.limb(w.n - 1), n: 1 };
+    let top = Work {
+        base: w.limb(w.n - 1),
+        n: 1,
+    };
     let ta = Work::alloc(sc, 2);
     let tb = Work::alloc(sc, 1);
     copy_work(e, sc, top, ta.truncated(1));
@@ -446,7 +456,11 @@ pub fn ashr_const(e: &mut Emitter, sc: &mut Scratch, w: Work, k: u32) {
     lshr_const(e, sc, w, k);
     // OR in the top k bits if negative: they are zero now, so add the mask.
     let bits = 8 * n as u32;
-    let mask: u64 = if bits == 64 { u64::MAX << (bits - k) } else { ((1u64 << bits) - 1) & (u64::MAX << (bits - k)) };
+    let mask: u64 = if bits == 64 {
+        u64::MAX << (bits - k)
+    } else {
+        ((1u64 << bits) - 1) & (u64::MAX << (bits - k))
+    };
     e.while_nonzero(sign, |e| {
         e.dec(sign);
         for i in 0..n {
@@ -527,7 +541,11 @@ pub fn mul_work(e: &mut Emitter, sc: &mut Scratch, a: Work, b: Work, res: Work) 
 pub fn mul_const(e: &mut Emitter, sc: &mut Scratch, a: Work, c: u64, res: Work) {
     let n = res.n;
     let bits = 8 * n as u32;
-    let c = if bits >= 64 { c } else { c & ((1u64 << bits) - 1) };
+    let c = if bits >= 64 {
+        c
+    } else {
+        c & ((1u64 << bits) - 1)
+    };
     if c == 0 {
         clear_work(e, a);
         return;
@@ -838,7 +856,11 @@ mod tests {
         let t = run_tape(e);
         // scratch must be clean
         let hw = sc.high_water as usize;
-        assert!(t[SC as usize..hw + 1].iter().all(|&x| x == 0), "scratch not clean: {:?}", &t[SC as usize..hw + 1]);
+        assert!(
+            t[SC as usize..hw + 1].iter().all(|&x| x == 0),
+            "scratch not clean: {:?}",
+            &t[SC as usize..hw + 1]
+        );
         t
     }
 
@@ -851,7 +873,11 @@ mod tests {
     }
 
     fn mask(n: usize) -> u64 {
-        if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 }
+        if n >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * n)) - 1
+        }
     }
 
     fn rng(seed: &mut u64) -> u64 {
@@ -863,7 +889,9 @@ mod tests {
 
     fn samples(n: usize) -> Vec<u64> {
         let mut s = 0x1234_5678_9abc_def1u64;
-        let mut v = vec![0, 1, 2, 127, 128, 255, 256, 0x7fff, 0x8000, 0xffff, 0xff00, 0x0102];
+        let mut v = vec![
+            0, 1, 2, 127, 128, 255, 256, 0x7fff, 0x8000, 0xffff, 0xff00, 0x0102,
+        ];
         for _ in 0..6 {
             v.push(rng(&mut s));
         }
@@ -871,7 +899,12 @@ mod tests {
     }
 
     /// Run `op` for operands a,b (n limbs), result at packed cell 0.
-    fn binop(n: usize, a: u64, b: u64, op: impl Fn(&mut Emitter, &mut Scratch, Work, Work, Work)) -> u64 {
+    fn binop(
+        n: usize,
+        a: u64,
+        b: u64,
+        op: impl Fn(&mut Emitter, &mut Scratch, Work, Work, Work),
+    ) -> u64 {
         let (mut e, mut sc) = mk();
         let wa = Work::alloc(&mut sc, n + 1);
         let wb = Work::alloc(&mut sc, n);
@@ -935,7 +968,11 @@ mod tests {
 
     fn sign_extend(v: u64, n: usize) -> i64 {
         let bits = 8 * n as u32;
-        if bits >= 64 { v as i64 } else { ((v << (64 - bits)) as i64) >> (64 - bits) }
+        if bits >= 64 {
+            v as i64
+        } else {
+            ((v << (64 - bits)) as i64) >> (64 - bits)
+        }
     }
 
     #[test]
@@ -1023,7 +1060,14 @@ mod tests {
                         move_work(e, wa.truncated(wr.n), wr);
                         ashr_const(e, sc, wr, k);
                     });
-                    assert_eq!(r, (sign_extend(a, n) >> k) as u64 & mask(n), "ashr n={} {} {}", n, a, k);
+                    assert_eq!(
+                        r,
+                        (sign_extend(a, n) >> k) as u64 & mask(n),
+                        "ashr n={} {} {}",
+                        n,
+                        a,
+                        k
+                    );
                     for kind in 0..3u8 {
                         let r = binop(n, a, k as u64, |e, sc, wa, wb, wr| {
                             move_work(e, wa.truncated(wr.n), wr);

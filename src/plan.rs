@@ -230,7 +230,11 @@ pub fn va_slot_size(size: usize) -> usize {
 }
 
 /// Byte offsets and sizes of the variadic arguments of a call, and the total area size.
-pub fn va_spill_layout(module: &Module, ti: &TypeInfo, call: &llvm_ir::instruction::Call) -> Result<(Vec<(usize, usize)>, usize)> {
+pub fn va_spill_layout(
+    module: &Module,
+    ti: &TypeInfo,
+    call: &llvm_ir::instruction::Call,
+) -> Result<(Vec<(usize, usize)>, usize)> {
     let fixed = match call.function_ty.as_ref() {
         Type::FuncType { param_types, .. } => param_types.len(),
         _ => bail!("call through non-function type"),
@@ -246,7 +250,13 @@ pub fn va_spill_layout(module: &Module, ti: &TypeInfo, call: &llvm_ir::instructi
 }
 
 pub fn call_is_variadic(call: &llvm_ir::instruction::Call) -> bool {
-    matches!(call.function_ty.as_ref(), Type::FuncType { is_var_arg: true, .. })
+    matches!(
+        call.function_ty.as_ref(),
+        Type::FuncType {
+            is_var_arg: true,
+            ..
+        }
+    )
 }
 
 fn plan_function(
@@ -261,12 +271,25 @@ fn plan_function(
     // Parameters.
     let mut poff = 0usize;
     for p in &f.parameters {
-        let size = ti.size_of(&p.ty).with_context(|| format!("parameter {} of {}", p.name, f.name))?;
-        slots.insert(p.name.clone(), Slot { kind: SlotKind::Param, off: poff, size });
+        let size = ti
+            .size_of(&p.ty)
+            .with_context(|| format!("parameter {} of {}", p.name, f.name))?;
+        slots.insert(
+            p.name.clone(),
+            Slot {
+                kind: SlotKind::Param,
+                off: poff,
+                size,
+            },
+        );
         poff += size;
     }
     let va_slot = if f.is_var_arg {
-        let s = Slot { kind: SlotKind::Param, off: poff, size: ti.ptr_bytes };
+        let s = Slot {
+            kind: SlotKind::Param,
+            off: poff,
+            size: ti.ptr_bytes,
+        };
         poff += ti.ptr_bytes;
         Some(s)
     } else {
@@ -275,7 +298,9 @@ fn plan_function(
     let params_size = poff;
     let ret_size = match f.return_type.as_ref() {
         Type::VoidType => 0,
-        _ => ti.size_of(&f.return_type).with_context(|| format!("return type of {}", f.name))?,
+        _ => ti
+            .size_of(&f.return_type)
+            .with_context(|| format!("return type of {}", f.name))?,
     };
     // Locals.
     let mut loff = 0usize;
@@ -287,17 +312,35 @@ fn plan_function(
                 if matches!(ty.as_ref(), Type::VoidType) {
                     continue;
                 }
-                let size = ti.size_of(&ty).with_context(|| format!("value %{} in {}", dest, f.name))?;
-                slots.insert(dest.clone(), Slot { kind: SlotKind::Local, off: loff, size });
+                let size = ti
+                    .size_of(&ty)
+                    .with_context(|| format!("value %{} in {}", dest, f.name))?;
+                slots.insert(
+                    dest.clone(),
+                    Slot {
+                        kind: SlotKind::Local,
+                        off: loff,
+                        size,
+                    },
+                );
                 loff += size;
             }
             let needs_extra = match inst {
                 Instruction::VAArg(_) => true,
-                Instruction::Call(c) => matches!(callee_name(c).as_deref(), Some(n) if n.starts_with("llvm.va_copy")),
+                Instruction::Call(c) => {
+                    matches!(callee_name(c).as_deref(), Some(n) if n.starts_with("llvm.va_copy"))
+                }
                 _ => false,
             };
             if needs_extra {
-                extra_slots.insert((bi, ii), Slot { kind: SlotKind::Local, off: loff, size: ti.ptr_bytes });
+                extra_slots.insert(
+                    (bi, ii),
+                    Slot {
+                        kind: SlotKind::Local,
+                        off: loff,
+                        size: ti.ptr_bytes,
+                    },
+                );
                 loff += ti.ptr_bytes;
             }
         }
@@ -316,8 +359,17 @@ fn plan_function(
         let mut segments: Vec<Segment> = Vec::new();
         let mut cur: Vec<Step> = Vec::new();
         let mut prev_end: Option<SegEnd> = None;
-        let finish = |segments: &mut Vec<Segment>, cur: &mut Vec<Step>, end: SegEnd, prev_end: &mut Option<SegEnd>, next_id: &mut u16| {
-            segments.push(Segment { id: *next_id, steps: std::mem::take(cur), end: end.clone(), prev_end: prev_end.take() });
+        let finish = |segments: &mut Vec<Segment>,
+                      cur: &mut Vec<Step>,
+                      end: SegEnd,
+                      prev_end: &mut Option<SegEnd>,
+                      next_id: &mut u16| {
+            segments.push(Segment {
+                id: *next_id,
+                steps: std::mem::take(cur),
+                end: end.clone(),
+                prev_end: prev_end.take(),
+            });
             *next_id = next_id.checked_add(1).expect("too many blocks");
             *prev_end = Some(end);
         };
@@ -328,7 +380,19 @@ fn plan_function(
                     let align = access_align(ti, &l.loaded_ty, l.alignment)?;
                     for (off, width) in chunks(size, align) {
                         note_kind(false, width);
-                        finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: false, off, width, role: AccessRole::Plain }), &mut prev_end, next_id);
+                        finish(
+                            &mut segments,
+                            &mut cur,
+                            SegEnd::Access(Access {
+                                instr: i,
+                                is_store: false,
+                                off,
+                                width,
+                                role: AccessRole::Plain,
+                            }),
+                            &mut prev_end,
+                            next_id,
+                        );
                     }
                 }
                 Instruction::Store(s) => {
@@ -337,22 +401,70 @@ fn plan_function(
                     let align = access_align(ti, &ty, s.alignment)?;
                     for (off, width) in chunks(size, align) {
                         note_kind(true, width);
-                        finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: true, off, width, role: AccessRole::Plain }), &mut prev_end, next_id);
+                        finish(
+                            &mut segments,
+                            &mut cur,
+                            SegEnd::Access(Access {
+                                instr: i,
+                                is_store: true,
+                                off,
+                                width,
+                                role: AccessRole::Plain,
+                            }),
+                            &mut prev_end,
+                            next_id,
+                        );
                     }
                 }
                 Instruction::VAArg(v) => {
                     for (off, width) in chunks(ti.ptr_bytes, 2) {
                         note_kind(false, width);
-                        finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: false, off, width, role: AccessRole::VaPtrLoad }), &mut prev_end, next_id);
+                        finish(
+                            &mut segments,
+                            &mut cur,
+                            SegEnd::Access(Access {
+                                instr: i,
+                                is_store: false,
+                                off,
+                                width,
+                                role: AccessRole::VaPtrLoad,
+                            }),
+                            &mut prev_end,
+                            next_id,
+                        );
                     }
                     let size = ti.size_of(&v.cur_type)?;
                     for (off, width) in chunks(size, 2) {
                         note_kind(false, width);
-                        finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: false, off, width, role: AccessRole::VaValue }), &mut prev_end, next_id);
+                        finish(
+                            &mut segments,
+                            &mut cur,
+                            SegEnd::Access(Access {
+                                instr: i,
+                                is_store: false,
+                                off,
+                                width,
+                                role: AccessRole::VaValue,
+                            }),
+                            &mut prev_end,
+                            next_id,
+                        );
                     }
                     for (off, width) in chunks(ti.ptr_bytes, 2) {
                         note_kind(true, width);
-                        finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: true, off, width, role: AccessRole::VaPtrStore }), &mut prev_end, next_id);
+                        finish(
+                            &mut segments,
+                            &mut cur,
+                            SegEnd::Access(Access {
+                                instr: i,
+                                is_store: true,
+                                off,
+                                width,
+                                role: AccessRole::VaPtrStore,
+                            }),
+                            &mut prev_end,
+                            next_id,
+                        );
                     }
                 }
                 Instruction::Call(c) => {
@@ -363,16 +475,52 @@ fn plan_function(
                         }
                         for (off, width) in chunks(ti.ptr_bytes, 2) {
                             note_kind(true, width);
-                            finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: true, off, width, role: AccessRole::VaStart }), &mut prev_end, next_id);
+                            finish(
+                                &mut segments,
+                                &mut cur,
+                                SegEnd::Access(Access {
+                                    instr: i,
+                                    is_store: true,
+                                    off,
+                                    width,
+                                    role: AccessRole::VaStart,
+                                }),
+                                &mut prev_end,
+                                next_id,
+                            );
                         }
                     } else if matches!(name.as_deref(), Some(n) if n.starts_with("llvm.va_copy")) {
                         for (off, width) in chunks(ti.ptr_bytes, 2) {
                             note_kind(false, width);
-                            finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: false, off, width, role: AccessRole::VaCopyLoad }), &mut prev_end, next_id);
+                            finish(
+                                &mut segments,
+                                &mut cur,
+                                SegEnd::Access(Access {
+                                    instr: i,
+                                    is_store: false,
+                                    off,
+                                    width,
+                                    role: AccessRole::VaCopyLoad,
+                                }),
+                                &mut prev_end,
+                                next_id,
+                            );
                         }
                         for (off, width) in chunks(ti.ptr_bytes, 2) {
                             note_kind(true, width);
-                            finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: true, off, width, role: AccessRole::VaCopyStore }), &mut prev_end, next_id);
+                            finish(
+                                &mut segments,
+                                &mut cur,
+                                SegEnd::Access(Access {
+                                    instr: i,
+                                    is_store: true,
+                                    off,
+                                    width,
+                                    role: AccessRole::VaCopyStore,
+                                }),
+                                &mut prev_end,
+                                next_id,
+                            );
                         }
                     } else if call_ends_segment(c)? {
                         if call_is_variadic(c) {
@@ -381,11 +529,29 @@ fn plan_function(
                             for (k, (aoff, size)) in layout.iter().enumerate() {
                                 for (off, width) in chunks(*size, 2) {
                                     note_kind(true, width);
-                                    finish(&mut segments, &mut cur, SegEnd::Access(Access { instr: i, is_store: true, off: aoff + off, width, role: AccessRole::VaSpill(k) }), &mut prev_end, next_id);
+                                    finish(
+                                        &mut segments,
+                                        &mut cur,
+                                        SegEnd::Access(Access {
+                                            instr: i,
+                                            is_store: true,
+                                            off: aoff + off,
+                                            width,
+                                            role: AccessRole::VaSpill(k),
+                                        }),
+                                        &mut prev_end,
+                                        next_id,
+                                    );
                                 }
                             }
                         }
-                        finish(&mut segments, &mut cur, SegEnd::Call(i), &mut prev_end, next_id);
+                        finish(
+                            &mut segments,
+                            &mut cur,
+                            SegEnd::Call(i),
+                            &mut prev_end,
+                            next_id,
+                        );
                     } else {
                         cur.push(Step::Instr(i));
                     }
@@ -393,7 +559,13 @@ fn plan_function(
                 _ => cur.push(Step::Instr(i)),
             }
         }
-        finish(&mut segments, &mut cur, SegEnd::Term, &mut prev_end, next_id);
+        finish(
+            &mut segments,
+            &mut cur,
+            SegEnd::Term,
+            &mut prev_end,
+            next_id,
+        );
         blocks.push(BlockPlan { segments });
     }
     Ok(FuncPlan {
@@ -452,7 +624,10 @@ impl<'a> ConstEval<'a> {
     pub fn scalar(&self, c: &Constant) -> Result<u64> {
         Ok(match c {
             Constant::Int { bits, value } => mask_bits(*value, *bits),
-            Constant::Null(_) | Constant::Undef(_) | Constant::Poison(_) | Constant::AggregateZero(_) => 0,
+            Constant::Null(_)
+            | Constant::Undef(_)
+            | Constant::Poison(_)
+            | Constant::AggregateZero(_) => 0,
             Constant::GlobalReference { name, .. } => {
                 let n = name_str(name);
                 if let Some(id) = self.func_ids.get(&n) {
@@ -476,10 +651,9 @@ impl<'a> ConstEval<'a> {
                         other => bail!("non-constant GEP index {}", other),
                     }
                 }
-                let off = self
-                    .geps
-                    .lookup(&base_name, &idx)
-                    .ok_or_else(|| anyhow!("constant GEP offset not found for @{} {:?}", base_name, idx))?;
+                let off = self.geps.lookup(&base_name, &idx).ok_or_else(|| {
+                    anyhow!("constant GEP offset not found for @{} {:?}", base_name, idx)
+                })?;
                 mask_bits((base as i64 + off) as u64, 8 * self.ti.ptr_bytes as u32)
             }
             Constant::PtrToInt(x) => mask_bits(self.scalar(&x.operand)?, self.bits_of(&x.to_type)?),
@@ -489,15 +663,27 @@ impl<'a> ConstEval<'a> {
             Constant::Trunc(x) => mask_bits(self.scalar(&x.operand)?, self.bits_of(&x.to_type)?),
             Constant::Add(x) => {
                 let bits = self.bits_of(&self.module.type_of(c))?;
-                mask_bits(self.scalar(&x.operand0)?.wrapping_add(self.scalar(&x.operand1)?), bits)
+                mask_bits(
+                    self.scalar(&x.operand0)?
+                        .wrapping_add(self.scalar(&x.operand1)?),
+                    bits,
+                )
             }
             Constant::Sub(x) => {
                 let bits = self.bits_of(&self.module.type_of(c))?;
-                mask_bits(self.scalar(&x.operand0)?.wrapping_sub(self.scalar(&x.operand1)?), bits)
+                mask_bits(
+                    self.scalar(&x.operand0)?
+                        .wrapping_sub(self.scalar(&x.operand1)?),
+                    bits,
+                )
             }
             Constant::Mul(x) => {
                 let bits = self.bits_of(&self.module.type_of(c))?;
-                mask_bits(self.scalar(&x.operand0)?.wrapping_mul(self.scalar(&x.operand1)?), bits)
+                mask_bits(
+                    self.scalar(&x.operand0)?
+                        .wrapping_mul(self.scalar(&x.operand1)?),
+                    bits,
+                )
             }
             Constant::Xor(x) => self.scalar(&x.operand0)? ^ self.scalar(&x.operand1)?,
             Constant::Shl(x) => {
@@ -514,7 +700,10 @@ impl<'a> ConstEval<'a> {
         let rty = self.ti.resolve(ty)?;
         let mut out = vec![0u8; size];
         match c {
-            Constant::Null(_) | Constant::Undef(_) | Constant::Poison(_) | Constant::AggregateZero(_) => {}
+            Constant::Null(_)
+            | Constant::Undef(_)
+            | Constant::Poison(_)
+            | Constant::AggregateZero(_) => {}
             Constant::Struct { values, .. } => {
                 let (offsets, _) = self.ti.struct_layout(ty)?;
                 let elem_types = match rty {
@@ -526,7 +715,10 @@ impl<'a> ConstEval<'a> {
                     out[offsets[i]..offsets[i] + b.len()].copy_from_slice(&b);
                 }
             }
-            Constant::Array { element_type, elements } => {
+            Constant::Array {
+                element_type,
+                elements,
+            } => {
                 let es = self.ti.size_of(element_type)?;
                 for (i, v) in elements.iter().enumerate() {
                     let b = self.bytes(v, element_type)?;
@@ -545,7 +737,13 @@ impl<'a> ConstEval<'a> {
     }
 }
 
-pub fn plan_module(module: &Module, ti: &TypeInfo, geps: &GepTable, mem_size: usize, entry: &str) -> Result<Plan> {
+pub fn plan_module(
+    module: &Module,
+    ti: &TypeInfo,
+    geps: &GepTable,
+    mem_size: usize,
+    entry: &str,
+) -> Result<Plan> {
     let mut next_id: u16 = 1; // 0 is reserved (null function pointer / halt)
     let start_id = next_id;
     let exit_id = next_id + 1;
@@ -589,10 +787,21 @@ pub fn plan_module(module: &Module, ti: &TypeInfo, geps: &GepTable, mem_size: us
     let heap_start = (addr + 7) / 8 * 8;
     globals.insert("__llvbf_heap_start".to_string(), heap_start);
     if heap_start as usize > mem_size {
-        bail!("global data ({} bytes) does not fit into memory of {} bytes", heap_start, mem_size);
+        bail!(
+            "global data ({} bytes) does not fit into memory of {} bytes",
+            heap_start,
+            mem_size
+        );
     }
-    let func_ids: HashMap<String, u16> = funcs.iter().map(|f| (f.name.clone(), f.entry_id)).collect();
-    let ce = ConstEval { module, ti, geps, globals: &globals, func_ids: &func_ids };
+    let func_ids: HashMap<String, u16> =
+        funcs.iter().map(|f| (f.name.clone(), f.entry_id)).collect();
+    let ce = ConstEval {
+        module,
+        ti,
+        geps,
+        globals: &globals,
+        func_ids: &func_ids,
+    };
     let mut global_bytes = Vec::new();
     for g in &module.global_vars {
         let n = name_str(&g.name);
@@ -600,7 +809,9 @@ pub fn plan_module(module: &Module, ti: &TypeInfo, geps: &GepTable, mem_size: us
             continue;
         }
         let (_, base, ty) = sizes.iter().find(|(m, _, _)| *m == n).unwrap();
-        let bytes = ce.bytes(g.initializer.as_ref().unwrap(), ty).with_context(|| format!("initializer of @{}", n))?;
+        let bytes = ce
+            .bytes(g.initializer.as_ref().unwrap(), ty)
+            .with_context(|| format!("initializer of @{}", n))?;
         for (i, b) in bytes.iter().enumerate() {
             if *b != 0 {
                 global_bytes.push((base + i as u64, *b));

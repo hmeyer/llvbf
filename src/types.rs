@@ -12,7 +12,10 @@ pub struct TypeInfo<'m> {
 impl<'m> TypeInfo<'m> {
     pub fn new(module: &'m Module) -> Self {
         let ptr_bits = module.data_layout.alignments.ptr_alignment(0).size;
-        TypeInfo { module, ptr_bytes: (ptr_bits as usize + 7) / 8 }
+        TypeInfo {
+            module,
+            ptr_bytes: (ptr_bits as usize + 7) / 8,
+        }
     }
 
     /// Resolve named struct types to their definitions.
@@ -47,10 +50,21 @@ impl<'m> TypeInfo<'m> {
                 (self.module.data_layout.alignments.int_alignment(*bits).abi as usize).max(8) / 8
             }
             Type::PointerType { addr_space } => {
-                (self.module.data_layout.alignments.ptr_alignment(*addr_space).alignment.abi as usize).max(8) / 8
+                (self
+                    .module
+                    .data_layout
+                    .alignments
+                    .ptr_alignment(*addr_space)
+                    .alignment
+                    .abi as usize)
+                    .max(8)
+                    / 8
             }
             Type::ArrayType { element_type, .. } => self.align_of(element_type)?,
-            Type::StructType { element_types, is_packed } => {
+            Type::StructType {
+                element_types,
+                is_packed,
+            } => {
                 if *is_packed {
                     1
                 } else {
@@ -76,7 +90,10 @@ impl<'m> TypeInfo<'m> {
                 (raw + a - 1) / a * a
             }
             Type::PointerType { .. } => self.ptr_bytes,
-            Type::ArrayType { element_type, num_elements } => self.size_of(element_type)? * num_elements,
+            Type::ArrayType {
+                element_type,
+                num_elements,
+            } => self.size_of(element_type)? * num_elements,
             Type::StructType { .. } => self.struct_layout(&ty)?.1,
             Type::VoidType => 0,
             t => bail!("unsupported type {}", t),
@@ -87,7 +104,10 @@ impl<'m> TypeInfo<'m> {
     pub fn struct_layout(&self, ty: &TypeRef) -> Result<(Vec<usize>, usize)> {
         let ty = self.resolve_ref(ty)?;
         match ty.as_ref() {
-            Type::StructType { element_types, is_packed } => {
+            Type::StructType {
+                element_types,
+                is_packed,
+            } => {
                 let mut offsets = Vec::with_capacity(element_types.len());
                 let mut off = 0usize;
                 let mut max_align = 1usize;
@@ -116,7 +136,9 @@ impl<'m> TypeInfo<'m> {
                 }
                 Ok((element_types[idx].clone(), offsets[idx]))
             }
-            Type::ArrayType { element_type, .. } => Ok((element_type.clone(), idx * self.size_of(element_type)?)),
+            Type::ArrayType { element_type, .. } => {
+                Ok((element_type.clone(), idx * self.size_of(element_type)?))
+            }
             t => bail!("cannot index into type {}", t),
         }
     }
@@ -140,6 +162,9 @@ impl<'m> TypeInfo<'m> {
     }
 
     pub fn is_scalar(&self, ty: &TypeRef) -> bool {
-        matches!(ty.as_ref(), Type::IntegerType { .. } | Type::PointerType { .. })
+        matches!(
+            ty.as_ref(),
+            Type::IntegerType { .. } | Type::PointerType { .. }
+        )
     }
 }

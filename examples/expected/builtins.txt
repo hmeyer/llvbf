@@ -1,0 +1,26 @@
+add_overflow: 1 -25536
+sub_overflow: 1 25536
+uadd_overflow: 1 4464
+umul_overflow: 1 24464
+popcount(0x5555) = 8, clz(1) = 15, ctz(0x40) = 6
+bswap16(0x1234) = 3412
+abs(-5) = 5, labs(-70000) = 70000
+rotl16(0x8001, 1) = 3
+rotl16(0x8001, 8) = 180
+rotl16(0x8001, 15) = c000
+swap: 4 3
+ack(2, 3) = 9
+0 is zero
+2 is small
+10 is ten
+100 is hundred
+-1 is minus one
+42 is other
+i8: -14 -2 -25, u8: 28 144
+0xbeef >> 0 = 0xbeef, << 0 = 0xbeef
+0xbeef >> 5 = 0x5f7, << 5 = 0xdde0
+0xbeef >> 10 = 0x2f, << 10 = 0xbc00
+0xbeef >> 15 = 0x1, << 15 = 0x8000
+signed shifts: -125 -125
+compare: 1 0 1 1
+long: -294967296 666666666 0

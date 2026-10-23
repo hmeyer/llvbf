@@ -52,7 +52,9 @@ fn real_main() -> Result<()> {
             }
             let code = llvbf::compile_file(&input, &opts)?;
             match out {
-                Some(p) => std::fs::write(&p, code).with_context(|| format!("writing {}", p.display()))?,
+                Some(p) => {
+                    std::fs::write(&p, code).with_context(|| format!("writing {}", p.display()))?
+                }
                 None => {
                     use std::io::Write;
                     std::io::stdout().write_all(&code)?;
@@ -78,7 +80,8 @@ fn real_main() -> Result<()> {
                     }
                     "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => opts.opt_level = a.to_string(),
                     "--mem-size" => {
-                        opts.codegen.mem_size = args.get(i + 1).unwrap_or_else(|| usage()).parse()?;
+                        opts.codegen.mem_size =
+                            args.get(i + 1).unwrap_or_else(|| usage()).parse()?;
                         i += 1;
                     }
                     "--comments" => opts.codegen.comments = true,
@@ -87,26 +90,35 @@ fn real_main() -> Result<()> {
                         i += 1;
                     }
                     "--runtime" => {
-                        opts.runtime_dir = Some(PathBuf::from(args.get(i + 1).unwrap_or_else(|| usage())));
+                        opts.runtime_dir =
+                            Some(PathBuf::from(args.get(i + 1).unwrap_or_else(|| usage())));
                         i += 1;
                     }
                     "--no-runtime" => opts.no_runtime = true,
                     "--keep-ir" => {
-                        opts.keep_ir = Some(PathBuf::from(args.get(i + 1).unwrap_or_else(|| usage())));
+                        opts.keep_ir =
+                            Some(PathBuf::from(args.get(i + 1).unwrap_or_else(|| usage())));
                         i += 1;
                     }
                     "--llvm-bin" => {
-                        opts.llvm_bin = Some(PathBuf::from(args.get(i + 1).unwrap_or_else(|| usage())));
+                        opts.llvm_bin =
+                            Some(PathBuf::from(args.get(i + 1).unwrap_or_else(|| usage())));
                         i += 1;
                     }
                     "-I" | "-D" | "-Xclang" | "-include" => {
                         if a != "-Xclang" {
                             opts.extra_clang_args.push(a.to_string());
                         }
-                        opts.extra_clang_args.push(args.get(i + 1).unwrap_or_else(|| usage()).clone());
+                        opts.extra_clang_args
+                            .push(args.get(i + 1).unwrap_or_else(|| usage()).clone());
                         i += 1;
                     }
-                    _ if a.starts_with("-I") || a.starts_with("-D") || a.starts_with("-W") || a.starts_with("-f") || a.starts_with("-std=") => {
+                    _ if a.starts_with("-I")
+                        || a.starts_with("-D")
+                        || a.starts_with("-W")
+                        || a.starts_with("-f")
+                        || a.starts_with("-std=") =>
+                    {
                         opts.extra_clang_args.push(a.to_string());
                     }
                     _ if a.starts_with('-') => usage(),
@@ -132,7 +144,8 @@ fn real_main() -> Result<()> {
             }
         }
         "run" => {
-            let src = std::fs::read_to_string(&args[2]).with_context(|| format!("reading {}", args[2]))?;
+            let src = std::fs::read_to_string(&args[2])
+                .with_context(|| format!("reading {}", args[2]))?;
             let mut max_steps = None;
             let mut stats = false;
             let mut i = 3;
@@ -154,7 +167,12 @@ fn real_main() -> Result<()> {
             let mut out = stdout.lock();
             let st = prog.run(&mut inp, &mut out, max_steps)?;
             if stats {
-                eprintln!("[llvbf] {} ops executed, {} tape cells used, {} compiled ops", st.steps, st.max_cell + 1, prog.len());
+                eprintln!(
+                    "[llvbf] {} ops executed, {} tape cells used, {} compiled ops",
+                    st.steps,
+                    st.max_cell + 1,
+                    prog.len()
+                );
             }
         }
         _ => bail!("unknown command {}", args[1]),

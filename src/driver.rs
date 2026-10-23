@@ -52,11 +52,19 @@ fn find_tool(bin: &Option<PathBuf>, name: &str) -> Result<PathBuf> {
         }
     };
     for c in candidates {
-        if Command::new(&c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        if Command::new(&c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             return Ok(c);
         }
     }
-    bail!("cannot find LLVM tool '{}' (set LLVBF_LLVM_BIN or --llvm-bin)", name)
+    bail!(
+        "cannot find LLVM tool '{}' (set LLVBF_LLVM_BIN or --llvm-bin)",
+        name
+    )
 }
 
 pub fn default_runtime_dir() -> PathBuf {
@@ -96,13 +104,20 @@ pub fn compile_to_bitcode(opts: &CcOptions, work: &Path) -> Result<PathBuf> {
         for f in ["io.c", "string.c", "stdlib.c", "ctype.c"] {
             let p = rt.join(f);
             if !p.exists() {
-                bail!("runtime file {} not found (set LLVBF_RUNTIME or --runtime)", p.display());
+                bail!(
+                    "runtime file {} not found (set LLVBF_RUNTIME or --runtime)",
+                    p.display()
+                );
             }
             sources.push(p);
         }
     }
     for (i, src) in sources.iter().enumerate() {
-        let obj = work.join(format!("{}_{}.bc", i, src.file_stem().and_then(|s| s.to_str()).unwrap_or("src")));
+        let obj = work.join(format!(
+            "{}_{}.bc",
+            i,
+            src.file_stem().and_then(|s| s.to_str()).unwrap_or("src")
+        ));
         let mut cmd = Command::new(&clang);
         cmd.arg("-target")
             .arg(&opts.target)
@@ -147,7 +162,10 @@ pub fn compile_to_bitcode(opts: &CcOptions, work: &Path) -> Result<PathBuf> {
         _ => "default<Os>",
     };
     cmd.arg(format!("-passes=internalize,globaldce,{},globaldce", level))
-        .arg(format!("-internalize-public-api-list={},memcpy,memmove,memset", opts.codegen.entry))
+        .arg(format!(
+            "-internalize-public-api-list={},memcpy,memmove,memset",
+            opts.codegen.entry
+        ))
         .arg(&linked)
         .arg("-o")
         .arg(&optimized);

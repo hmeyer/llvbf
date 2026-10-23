@@ -26,7 +26,12 @@ impl Default for Emitter {
 
 impl Emitter {
     pub fn new() -> Self {
-        Emitter { code: Vec::new(), pos: 0, comments: false, line_len: 0 }
+        Emitter {
+            code: Vec::new(),
+            pos: 0,
+            comments: false,
+            line_len: 0,
+        }
     }
 
     pub fn code(&self) -> &[u8] {
@@ -377,7 +382,10 @@ pub(crate) mod tests {
     /// Run emitted code on a fresh tape and return the tape.
     pub fn run_tape(e: &Emitter) -> Vec<u8> {
         let src = String::from_utf8(e.code().to_vec()).unwrap();
-        let (_, tape, _) = Program::parse(&src).unwrap().run_with_tape(b"", Some(100_000_000)).unwrap();
+        let (_, tape, _) = Program::parse(&src)
+            .unwrap()
+            .run_with_tape(b"", Some(100_000_000))
+            .unwrap();
         tape
     }
 
