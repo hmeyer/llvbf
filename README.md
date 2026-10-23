@@ -36,8 +36,9 @@ Working:
   `stdlib.h` (bump `malloc`, `exit`, `atoi`, `strtol`, `rand`, `qsort`), `ctype.h`, `assert.h`.
 
 Not supported: floating point, vectors, atomics, exceptions, dynamic `alloca`, inline assembly,
-external globals. Memory is at most 64 KiB (pointers are 32 bits wide but only the low 16 are
-used for addressing). End of input is reported as `0` (or `255` on interpreters that use -1),
+external globals. Memory is at most 64 KiB: pointers are 32 bits wide in memory and as integers,
+but only their low 16 bits are stored in frame slots and used for addressing, so pointer
+arithmetic wraps at 64 KiB. End of input is reported as `0` (or `255` on interpreters that use -1),
 which the runtime maps to `EOF`.
 
 ## Building
@@ -219,6 +220,9 @@ multiplication is shift-and-add; division is restoring long division; signed ope
 unsigned ones by flipping sign bits; bitwise operations decompose limbs into bits. Everything is
 unit-tested against native arithmetic (`cargo test`).
 
+Pointer values occupy two limbs in slots and in address arithmetic (`getelementptr`, `MSP`),
+whatever their width in memory; `ptrtoint` zero-extends and `inttoptr` truncates.
+
 Multiplications by a variable and all divisions are not emitted inline: like memory accesses they
 are requests to a shared routine per (operation, width), issued through the `ARG` cells and
 serviced at the end of the dispatch iteration. The routine works in the free tape above the
@@ -242,10 +246,10 @@ default 32-bit target and the 16-bit mode:
 
 | program | riscv32 size / ops | msp430 size / ops |
 |---|---|---|
-| fib(0..15), recursive, printf | 0.80 MB / 55 M | 0.49 MB / 57 M |
-| bubble sort | 0.86 MB / 7.6 M | 0.50 MB / 6.9 M |
-| strings | 1.04 MB / 17 M | 0.58 MB / 16 M |
-| sieve to 200 | 0.81 MB / 42 M | 0.52 MB / 39 M |
+| fib(0..15), recursive, printf | 0.65 MB / 55 M | 0.49 MB / 57 M |
+| bubble sort | 0.66 MB / 7.6 M | 0.50 MB / 6.9 M |
+| strings | 0.77 MB / 17 M | 0.58 MB / 16 M |
+| sieve to 200 | 0.66 MB / 42 M | 0.52 MB / 39 M |
 
 Almost all of the size is head movement (`>>>…`) between frame slots and scratch, so the size
 of a program is governed by the frame width and by how far each operand sits from the scratch
@@ -314,11 +318,14 @@ precompiled `core` for it, so Rust programs compile on stable. msp430 stays avai
 
 ## Future work
 
-* Slot pooling by liveness and moving (rather than copying) values on their last use would cut
-  the output size by an order of magnitude; the first version deliberately keeps one slot per value.
-* Structured control flow (relooper) for loops inside a function would avoid the dispatch chain
-  for the hottest edges.
-* Exploit the known-zero upper limbs of 32-bit pointers (the address space is 64 KiB).
+* Structured control flow (relooper) for loops whose bodies contain no calls or memory accesses:
+  such a loop could be a real Brainfuck `[...]` instead of a round through the dispatch chain per
+  iteration, which is where branches spend both bytes and time.
+* Memory accesses hop down the whole stack of frames and back, so their cost grows with the
+  recursion depth. Placing memory on the other side of frame 0, or remembering the hop count per
+  frame, would make them independent of it.
+* Calls still cost a frame switch plus a dispatch round; this is most of the gap between `-Oz`
+  and `-Os` in executed operations, and it hurts the 16-bit mode most.
 * Other frontends: Zig and C++ (without exceptions and RTTI) should work like Rust does; the
   runtime hooks are just `__llvbf_putc`, `__llvbf_getc` and `__llvbf_exit`.
 

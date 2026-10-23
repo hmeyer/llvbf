@@ -196,7 +196,7 @@ impl<'a> Gen<'a> {
     pub(super) fn emit_ret(&mut self, value: &Option<Operand>) -> Result<()> {
         let lay = self.lay.clone();
         if let Some(op) = value {
-            let size = self.types().size(op.ty);
+            let size = self.types().slot_size(op.ty);
             let m = self.sc.mark();
             let w = Work::alloc(&mut self.sc, size);
             self.load_any(op, w)?;

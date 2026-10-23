@@ -22,16 +22,18 @@ impl<'a> Gen<'a> {
             AccessRole::VaPtrLoad | AccessRole::VaCopyLoad => self.extra_slot(block, a.instr)?,
             _ => bail!("internal error: finish_load on a store"),
         };
-        if a.off + a.width > size {
-            bail!("load chunk out of bounds");
-        }
         if a.off == 0 {
             // First chunk: the slot is being defined.
             self.clear_slot(cell, size);
         }
+        // Bytes beyond the slot (the high bytes of a pointer) are dropped.
         for k in 0..a.width {
-            self.e
-                .move_cell(self.lay.data + k as Cell, cell + (a.off + k) as Cell);
+            if a.off + k < size {
+                self.e
+                    .move_cell(self.lay.data + k as Cell, cell + (a.off + k) as Cell);
+            } else {
+                self.e.clear(self.lay.data + k as Cell);
+            }
         }
         Ok(())
     }
@@ -118,16 +120,11 @@ impl<'a> Gen<'a> {
                         .va_slot
                         .ok_or_else(|| anyhow!("va_start in non-variadic function"))?;
                     let cell = self.slot_cell(&s);
-                    self.copy_cells(
-                        cell + a.off as Cell,
-                        lay.data,
-                        a.width,
-                        cell + s.size as Cell,
-                    );
+                    self.copy_slot_to_data(cell, s.size, a.off, a.width);
                 }
                 (AccessRole::VaCopyStore, _) => {
                     let (cell, size) = self.extra_slot(block, a.instr)?;
-                    self.copy_cells(cell + a.off as Cell, lay.data, a.width, cell + size as Cell);
+                    self.copy_slot_to_data(cell, size, a.off, a.width);
                 }
                 (AccessRole::VaPtrStore, _) => {
                     // The advanced argument pointer: saved pointer + size of the argument slot.
@@ -136,13 +133,15 @@ impl<'a> Gen<'a> {
                     let full = Work::alloc(&mut self.sc, n);
                     load_packed(&mut self.e, &mut self.sc, cell, full);
                     let (adv, slot_align) = va_slot(self.types(), inst.ty);
-                    if slot_align > self.ptr_limbs() {
+                    if slot_align > self.types().ptr_bytes {
                         bail!("va_arg of an over-aligned type is not supported on this target");
                     }
                     add_const(&mut self.e, &mut self.sc, full, adv as u64);
                     for k in 0..a.width {
                         self.e.clear(lay.data + k as Cell);
-                        self.e.move_cell(full.limb(a.off + k), lay.data + k as Cell);
+                        if a.off + k < n {
+                            self.e.move_cell(full.limb(a.off + k), lay.data + k as Cell);
+                        }
                     }
                     clear_work(&mut self.e, full);
                     self.sc.release(m);
@@ -156,11 +155,19 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Copy `n` cells from `src` to `dst` (cleared first) through the zero cell `tmp`.
-    fn copy_cells(&mut self, src: Cell, dst: Cell, n: usize, tmp: Cell) {
-        for i in 0..n {
-            self.e.clear(dst + i as Cell);
-            self.e.copy_cell(src + i as Cell, dst + i as Cell, tmp);
+    /// Copy bytes `off..off+width` of a slot into `DATA` (cleared first) through the
+    /// slot's pad; bytes beyond the slot (the high bytes of a pointer) are zero.
+    fn copy_slot_to_data(&mut self, cell: Cell, size: usize, off: usize, width: usize) {
+        let data = self.lay.data;
+        for i in 0..width {
+            self.e.clear(data + i as Cell);
+            if off + i < size {
+                self.e.copy_cell(
+                    cell + (off + i) as Cell,
+                    data + i as Cell,
+                    cell + size as Cell,
+                );
+            }
         }
     }
 

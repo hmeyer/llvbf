@@ -348,15 +348,15 @@ fn plan_function(
         let s = Slot {
             kind: SlotKind::Param,
             off: poff,
-            size: types.ptr_bytes,
+            size: types.addr_bytes(),
         };
-        poff += types.ptr_bytes + 1;
+        poff += types.addr_bytes() + 1;
         Some(s)
     } else {
         None
     };
     let params_size = poff;
-    let ret_size = types.size(f.ret);
+    let ret_size = types.slot_size(f.ret);
     // Where is each value used? A phi's incoming value counts as a use at the end of
     // the predecessor block. Values whose uses all lie in their defining block are
     // pooled; phis and cross-block values get dedicated slots.
@@ -427,7 +427,7 @@ fn plan_function(
             pool.release_dead(ii);
             if let Some(dest) = inst.dest {
                 if is_local(dest) {
-                    let size = types.size(inst.ty);
+                    let size = types.slot_size(inst.ty);
                     let end = uses
                         .get(&dest)
                         .and_then(|u| u.iter().map(|(_, p)| *p).max())
@@ -451,13 +451,13 @@ fn plan_function(
                 _ => false,
             };
             if needs_extra {
-                let off = pool.alloc(types.ptr_bytes + 1, ii);
+                let off = pool.alloc(types.addr_bytes() + 1, ii);
                 extra_slots.insert(
                     (bi, ii),
                     Slot {
                         kind: SlotKind::Pool,
                         off,
-                        size: types.ptr_bytes,
+                        size: types.addr_bytes(),
                     },
                 );
             }
@@ -564,7 +564,7 @@ pub fn param_offsets(types: &TypeTable, tys: &[TypeId]) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
     let mut off = 0;
     for &t in tys {
-        let s = types.size(t);
+        let s = types.slot_size(t);
         v.push((off, s));
         off += s + 1;
     }
@@ -784,7 +784,9 @@ fn allocate_cross_block(
         for phi in &bb.phis {
             for (val, _) in &phi.incoming {
                 let Some(v) = val.as_value() else { continue };
-                if !def_pos.contains_key(&v) || types.size(f.value_ty(v)) != types.size(phi.ty) {
+                if !def_pos.contains_key(&v)
+                    || types.slot_size(f.value_ty(v)) != types.slot_size(phi.ty)
+                {
                     continue;
                 }
                 let (gp, gv) = (group_of[&phi.dest], group_of[&v]);
@@ -822,7 +824,7 @@ fn allocate_cross_block(
     let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (off, len, start, end)
     let mut top = 0;
     for (start, end, members) in live_groups {
-        let size = types.size(f.value_ty(members[0]));
+        let size = types.slot_size(f.value_ty(members[0]));
         let len = size + 1;
         let overlapping: Vec<(usize, usize)> = placed
             .iter()

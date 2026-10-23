@@ -82,13 +82,14 @@ pub struct Layout {
     pub ctl: Cell,
     pub block: Cell,
     pub num_blocks: usize,
-    pub ptr_bytes: usize,
+    /// Cells of an address (`MSP`, pointer slots): see [`TypeTable::addr_bytes`].
+    pub addr_bytes: usize,
 }
 
 impl Layout {
     /// Frame layout: return value, parameters, control header, pooled slots,
     /// arithmetic request cells, scratch, dedicated slots.
-    fn new(plan: &Plan, ptr_bytes: usize, scratch_size: usize) -> Layout {
+    fn new(plan: &Plan, addr_bytes: usize, scratch_size: usize) -> Layout {
         // Return value and parameters first: parameters at the frame start keep the
         // caller's argument moves (into the next frame) short.
         let ret = 0;
@@ -118,7 +119,7 @@ impl Layout {
         // Then the pooled slots, the arithmetic request cells, the scratch area and
         // the dedicated slots: the scratch area, which every operand passes through,
         // sits between the two slot areas.
-        let pool = msp + ptr_bytes as Cell;
+        let pool = msp + addr_bytes as Cell;
         let arg = pool + plan.pool_max as Cell;
         let scratch = arg + plan.arg_size as Cell;
         // The scratch area also stages the arguments of calls.
@@ -153,7 +154,7 @@ impl Layout {
             ctl,
             block: ctl + 256,
             num_blocks: plan.mem_size / 256,
-            ptr_bytes,
+            addr_bytes,
         }
     }
 
@@ -223,7 +224,7 @@ fn run_gen(
     scratch_size: usize,
     arith_ws: usize,
 ) -> Result<(usize, usize, Vec<u8>)> {
-    let lay = Layout::new(plan, m.types.ptr_bytes, scratch_size);
+    let lay = Layout::new(plan, m.types.addr_bytes(), scratch_size);
     let mut e = Emitter::new();
     e.comments = opts.comments;
     let sc = Scratch::new(lay.scratch);
@@ -339,8 +340,17 @@ impl<'a> Gen<'a> {
         self.types().bits(op.ty)
     }
 
+    /// Limbs of an address (pointer values and `MSP`).
     fn ptr_limbs(&self) -> usize {
-        self.lay.ptr_bytes
+        self.lay.addr_bytes
+    }
+
+    /// Limbs of a scalar operand as held in its slot: pointers are address-sized.
+    fn operand_limbs(&self, op: &Operand) -> Result<usize> {
+        Ok(match self.types().kind(op.ty) {
+            TypeKind::Ptr => self.types().addr_bytes(),
+            _ => limbs(self.op_bits(op)?),
+        })
     }
 
     /// Load a scalar operand into a zeroed work area (zero-extending if the work is wider).
