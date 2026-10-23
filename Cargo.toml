@@ -1,0 +1,23 @@
+[package]
+name = "llvbf"
+version = "0.1.0"
+edition = "2021"
+description = "An LLVM backend that compiles LLVM IR to Brainfuck"
+license = "MIT"
+
+[lib]
+name = "llvbf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llvbf"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+llvm-ir = { version = "0.11", features = ["llvm-18"] }
+either = "1.15"
+llvm-sys = "181"
+
+[profile.release]
+debug = 1

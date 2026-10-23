@@ -1,0 +1,2 @@
+sum of squares 1..10 = 385
+10 nodes
