@@ -31,12 +31,18 @@ static const char *classify(int c) {
 }
 
 int main(void) {
-    int r;
-    printf("add_overflow: %d %d\n", __builtin_add_overflow(30000, 10000, &r), r);
-    printf("sub_overflow: %d %d\n", __builtin_sub_overflow(-30000, 10000, &r), r);
+    /* Overflow builtins; the results are computed before printing so that the
+       argument evaluation order cannot matter. */
+    int r, ovf;
     unsigned ur;
-    printf("uadd_overflow: %d %u\n", __builtin_add_overflow(60000u, 10000u, &ur), ur);
-    printf("umul_overflow: %d %u\n", __builtin_mul_overflow(300u, 300u, &ur), ur);
+    ovf = __builtin_add_overflow(2000000000, 2000000000, &r);
+    printf("add_overflow: %d %d\n", ovf, r);
+    ovf = __builtin_sub_overflow(-2000000000, 2000000000, &r);
+    printf("sub_overflow: %d %d\n", ovf, r);
+    ovf = __builtin_add_overflow(4000000000u, 1000000000u, &ur);
+    printf("uadd_overflow: %d %u\n", ovf, ur);
+    ovf = __builtin_mul_overflow(70000u, 70000u, &ur);
+    printf("umul_overflow: %d %u\n", ovf, ur);
     printf("popcount(0x5555) = %d, clz(1) = %d, ctz(0x40) = %d\n", __builtin_popcount(0x5555), __builtin_clz(1), __builtin_ctz(0x40));
     printf("bswap16(0x1234) = %x\n", __builtin_bswap16(0x1234));
     printf("abs(-5) = %d, labs(-70000) = %ld\n", abs(-5), labs(-70000L));

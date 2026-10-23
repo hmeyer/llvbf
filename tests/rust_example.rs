@@ -1,11 +1,14 @@
 //! End-to-end test of the Rust example in `examples/rust`.
 //!
-//! It needs a Rust nightly with the `rust-src` component whose LLVM matches the
-//! LLVM llvbf is built against; when `cargo +nightly` is unavailable or the build
-//! fails for toolchain reasons, the test is skipped with a message.
+//! It needs the `riscv32i-unknown-none-elf` target of the stable toolchain
+//! (`rustup target add riscv32i-unknown-none-elf`) and a rustc whose LLVM is not
+//! newer than the LLVM llvbf is built against; otherwise the test is skipped with
+//! a message.
 
 use std::path::PathBuf;
 use std::process::Command;
+
+const TARGET: &str = "riscv32i-unknown-none-elf";
 
 #[test]
 fn rust_example() {
@@ -13,49 +16,49 @@ fn rust_example() {
     let dir = root.join("examples/rust");
     let target_dir =
         std::env::temp_dir().join(format!("llvbf-rust-example-{}", std::process::id()));
-    let status = Command::new("cargo")
-        .args([
-            "+nightly",
-            "rustc",
-            "--release",
-            "--target",
-            "msp430-none-elf",
-            "-Zbuild-std=core,compiler_builtins",
-        ])
+    let build = Command::new("cargo")
+        .args(["rustc", "--release", "--target", TARGET])
         .arg("--target-dir")
         .arg(&target_dir)
         .args(["--", "--emit=llvm-ir"])
         .current_dir(&dir)
         .output();
-    let out = match status {
-        Ok(o) if o.status.success() => o,
+    match build {
+        Ok(o) if o.status.success() => {}
         Ok(o) => {
             eprintln!(
-                "skipping: nightly build failed:\n{}",
+                "skipping: Rust build failed (is the {} target installed?):\n{}",
+                TARGET,
                 String::from_utf8_lossy(&o.stderr)
             );
             return;
         }
         Err(e) => {
-            eprintln!("skipping: cannot run cargo +nightly: {}", e);
+            eprintln!("skipping: cannot run cargo: {}", e);
             return;
         }
-    };
-    let _ = out;
-    // Find the emitted IR.
-    let mut ll = None;
-    for entry in walk(&target_dir.join("msp430-none-elf/release")) {
-        if entry.extension().map(|e| e == "ll").unwrap_or(false)
-            && entry
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("bf_rust_example")
-        {
-            ll = Some(entry);
-        }
     }
-    let ll = ll.expect("no .ll produced by the nightly build");
+    // Find the emitted IR.
+    let ll = walk(&target_dir.join(TARGET).join("release"))
+        .into_iter()
+        .find(|p| {
+            p.extension().map(|e| e == "ll").unwrap_or(false)
+                && p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("bf_rust_example")
+        })
+        .unwrap_or_else(|| {
+            let listing: Vec<String> = walk(&target_dir)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            panic!(
+                "no .ll produced by the Rust build; files under {}:\n{}",
+                target_dir.display(),
+                listing.join("\n")
+            )
+        });
     let opts = llvbf::driver::CcOptions {
         sources: vec![ll],
         ..Default::default()
@@ -65,10 +68,7 @@ fn rust_example() {
         Err(e) => {
             let msg = format!("{:#}", e);
             if msg.contains("cannot parse IR") {
-                eprintln!(
-                    "skipping: the nightly's LLVM is newer than llvbf's: {}",
-                    msg
-                );
+                eprintln!("skipping: rustc's LLVM is newer than llvbf's: {}", msg);
                 return;
             }
             panic!("{}", msg);

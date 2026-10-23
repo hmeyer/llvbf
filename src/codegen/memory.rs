@@ -94,7 +94,10 @@ impl<'a> Gen<'a> {
                     let (cell, _) = self.extra_slot(block, a.instr)?;
                     let full = Work::alloc(&mut self.sc, n);
                     load_packed(&mut self.e, &mut self.sc, cell, full);
-                    let adv = va_slot_size(self.types().size(inst.ty));
+                    let (adv, slot_align) = va_slot(self.types(), inst.ty);
+                    if slot_align > self.ptr_limbs() {
+                        bail!("va_arg of an over-aligned type is not supported on this target");
+                    }
                     add_const(&mut self.e, &mut self.sc, full, adv as u64);
                     for k in 0..a.width {
                         self.e.move_cell(full.limb(a.off + k), dw.limb(k));
