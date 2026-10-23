@@ -121,6 +121,8 @@ impl Layout {
         let pool = msp + ptr_bytes as Cell;
         let arg = pool + plan.pool_max as Cell;
         let scratch = arg + plan.arg_size as Cell;
+        // The scratch area also stages the arguments of calls.
+        let scratch_size = scratch_size.max(plan.params_max);
         let locals = scratch + scratch_size as Cell;
         let frame = locals + plan.locals_max as Cell;
         Layout {
@@ -614,12 +616,8 @@ impl<'a> Gen<'a> {
             let entry_idx = self.plan.func_by_name(&self.opts.entry).unwrap();
             let entry_id = self.plan.funcs[entry_idx].entry_id;
             let f = lay.frame;
-            // Parameters of main (argc, argv) are left zero.
-            for i in 0..self.ptr_limbs() {
-                self.e.clear(f + lay.msp + i as Cell);
-                self.e
-                    .copy_cell(lay.msp + i as Cell, f + lay.msp + i as Cell, lay.tmp);
-            }
+            // Parameters of main (argc, argv) are left zero; main's prologue fetches
+            // them (and the memory stack pointer) from this frame.
             self.e.set(f + lay.active, 1);
             self.e.clear(f + lay.home);
             self.set_pc(f, entry_id);
@@ -645,6 +643,9 @@ impl<'a> Gen<'a> {
             s.id, fp.name, bb.name, seg
         ));
         let m = self.sc.mark();
+        if block == 0 && seg == 0 {
+            self.emit_prologue()?;
+        }
         // Finish what the previous segment started.
         match &s.prev_end {
             Some(SegEnd::Access(a)) if !a.is_store => self.finish_load(block, bb, *a)?,
